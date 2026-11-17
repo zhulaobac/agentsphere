@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentsphere"
 version = "0.1.0"
-description = "AgentSphere: enterprise agent production platform kernel, runtime, sandbox, and identity"
+description = "AgentSphere: enterprise agent production platform kernel, runtime, sandbox, identity, control plane, and evaluation"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }

@@ -1,5 +1,19 @@
-"""AgentSphere: Harness Kernel, Managed Runtime, Sandbox, Identity/Vault."""
+"""AgentSphere: Harness Kernel, Managed Runtime, Sandbox, Identity/Vault, Control Plane, Eval."""
 
+from agentsphere.controlplane import (
+    AgentArtifact,
+    ControlPlane,
+    GateDecision,
+    InMemoryControlStore,
+    ManagedRuntimeProvider,
+    Principal,
+)
+from agentsphere.evaluation import (
+    CodeCheckEvaluator,
+    ExperimentRunner,
+    ReleaseGate,
+    RuleAssertionEvaluator,
+)
 from agentsphere.identity import AgentIdentity, InMemoryAuditLog, InMemoryVault, StaticPolicyEngine
 from agentsphere.kernel import (
     AgentHarness,
@@ -21,8 +35,18 @@ from agentsphere.tool_registry import ToolRegistry, ToolSpec
 from agentsphere.trace import TraceRecorder
 
 __all__ = [
+    "AgentArtifact",
     "AgentHarness",
     "AgentIdentity",
+    "CodeCheckEvaluator",
+    "ControlPlane",
+    "ExperimentRunner",
+    "GateDecision",
+    "InMemoryControlStore",
+    "ManagedRuntimeProvider",
+    "Principal",
+    "ReleaseGate",
+    "RuleAssertionEvaluator",
     "CallModel",
     "CallTool",
     "Event",
