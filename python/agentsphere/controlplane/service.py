@@ -50,6 +50,21 @@ def _as_release_channel(channel: Any) -> ReleaseChannel:
         raise LifecycleError(f"invalid release channel {channel!r}") from exc
 
 
+def _snapshot_experiment_run(run: Any) -> Any:
+    from agentsphere.evaluation.experiment import ExperimentRun
+
+    try:
+        if isinstance(run, ExperimentRun):
+            stored = run.model_copy(deep=True)
+        elif hasattr(run, "model_dump"):
+            stored = ExperimentRun.model_validate(run.model_dump())
+        else:
+            stored = ExperimentRun.model_validate(run, from_attributes=True)
+    except (TypeError, ValueError) as exc:
+        raise LifecycleError("experiment run must be a snapshotable ExperimentRun") from exc
+    return stored.model_copy(deep=True)
+
+
 class ControlPlane:
     def __init__(
         self,
@@ -61,7 +76,7 @@ class ControlPlane:
         self.runtime = runtime
         self._experiments: dict[str, Any] = {}
 
-    def register_experiment(self, run: Any) -> Any:
+    def register_experiment(self, run: Any, *, tenant: str | None = None) -> Any:
         """Index a stored ExperimentRun so evaluation and Gate can look it up by id."""
         run_id = getattr(run, "run_id", None)
         if not run_id:
@@ -69,15 +84,24 @@ class ControlPlane:
         key = str(run_id)
         if key in self._experiments:
             raise LifecycleError(f"experiment run {key} is immutable")
-        stored = run.model_copy(deep=True) if hasattr(run, "model_copy") else run
+        stored = _snapshot_experiment_run(run)
+        spec = getattr(stored, "spec", None)
+        bound_tenant = tenant or (getattr(spec, "tenant", None) or "")
+        if not bound_tenant:
+            raise LifecycleError("experiment run is missing tenant")
+        if spec is not None and getattr(spec, "tenant", None) != bound_tenant:
+            stored = stored.model_copy(
+                update={"spec": spec.model_copy(update={"tenant": bound_tenant})},
+                deep=True,
+            )
         self._experiments[key] = stored
-        return stored
+        return stored.model_copy(deep=True)
 
     def get_experiment(self, run_id: str) -> Any | None:
         item = self._experiments.get(run_id)
         if item is None:
             return None
-        return item.model_copy(deep=True) if hasattr(item, "model_copy") else item
+        return item.model_copy(deep=True)
 
     async def put_asset(
         self,
@@ -198,7 +222,7 @@ class ControlPlane:
     async def build(self, name: str, version: str, principal: Principal) -> AgentArtifact:
         artifact = await self._require_mutable(name, version, principal, action="build")
         assert_transition_allowed(artifact.status.phase, LifecyclePhase.BUILT)
-        missing = await self._missing_dependencies(artifact)
+        missing = await self._missing_dependencies(artifact, principal)
         if missing:
             raise DependencyError(
                 "cannot Build; missing dependencies: " + ", ".join(r.display() for r in missing)
@@ -225,6 +249,7 @@ class ControlPlane:
             raise LifecycleError(
                 f"experiment run {experiment_run_id} does not belong to {name}@{version}"
             )
+        self._assert_experiment_tenant(run, artifact.metadata.tenant, experiment_run_id)
         artifact.status.lastExperimentRunId = experiment_run_id
         await self._emit(
             ControlEventType.EVALUATION_RECORDED,
@@ -273,6 +298,7 @@ class ControlPlane:
         spec = getattr(run, "spec", None)
         if spec is not None and (spec.agent_name != name or spec.agent_version != version):
             raise LifecycleError(f"experiment run {run_id} does not belong to {name}@{version}")
+        self._assert_experiment_tenant(run, artifact.metadata.tenant, run_id)
         if not artifact.status.lastExperimentRunId:
             raise LifecycleError("cannot record a Gate before evaluation")
         if run_id != artifact.status.lastExperimentRunId:
@@ -465,7 +491,7 @@ class ControlPlane:
             tenant=artifact.metadata.tenant,
             details={"deployment_id": stored_dep.deployment_id, "weight": desired_weight},
         )
-        await self._bind_runtime(artifact, stored_dep)
+        await self._bind_runtime(artifact, stored_dep, principal)
         return artifact, stored_dep
 
     async def promote(
@@ -531,7 +557,7 @@ class ControlPlane:
             tenant=artifact.metadata.tenant,
             details={"deployment_id": stored.deployment_id, "promoted_from": "Canary"},
         )
-        await self._bind_runtime(artifact, stored)
+        await self._bind_runtime(artifact, stored, principal)
         return artifact, stored
 
     async def deprecate(self, name: str, version: str, principal: Principal, *, reason: str = "") -> AgentArtifact:
@@ -577,13 +603,15 @@ class ControlPlane:
             if d.status is DeploymentStatus.ACTIVE
         ]
         from_ver = from_version or (current_active[-1].agent_version if current_active else None)
-        if from_ver == to_version and any(
-            d.agent_version == to_version and d.channel is ReleaseChannel.CANARY
-            for d in current_active
-        ):
-            raise LifecycleError(
-                "cannot rollback the active canary of this version; promote instead"
-            )
+        if current_active:
+            latest_active = current_active[-1]
+            if (
+                latest_active.agent_version == to_version
+                and latest_active.channel is ReleaseChannel.CANARY
+            ):
+                raise LifecycleError(
+                    "cannot rollback the active canary of this version; promote instead"
+                )
         restore_full = self._version_was_full(
             tenant=target.metadata.tenant,
             name=name,
@@ -631,7 +659,18 @@ class ControlPlane:
         )
         stored = self.store.put_deployment(restored)
         target.status.phase = LifecyclePhase.RELEASED
-        target.status.releaseChannel = restore_channel
+        if restore_full:
+            target.status.releaseChannel = ReleaseChannel.FULL
+        else:
+            still_full = any(
+                d.status is DeploymentStatus.ACTIVE and d.channel is ReleaseChannel.FULL
+                for d in self.store.list_deployments(
+                    tenant=target.metadata.tenant, name=name
+                )
+                if d.environment != environment
+            )
+            if not still_full:
+                target.status.releaseChannel = restore_channel
         target.status.deployedVersions.append(
             DeployedVersion(
                 version=to_version,
@@ -659,7 +698,7 @@ class ControlPlane:
                 "reason": reason,
             },
         )
-        await self._bind_runtime(target, stored)
+        await self._bind_runtime(target, stored, principal)
         return target, stored
 
     async def record_slo(
@@ -783,39 +822,53 @@ class ControlPlane:
         )
 
     async def _record_lineage(self, artifact: AgentArtifact, principal: Principal) -> None:
+        consumer_tenant = artifact.metadata.tenant
         source = AssetRef(
             kind=AssetKind.AGENT,
             name=artifact.metadata.name,
             version=artifact.version,
-            tenant=artifact.metadata.tenant,
+            tenant=consumer_tenant,
         )
-        existing = {e.target.display() for e in self.store.list_edges(source=source.key(artifact.metadata.tenant))}
+        existing = {e.target.display() for e in self.store.list_edges(source=source.exact_key())}
         for ref in artifact.spec.dependency_refs():
+            if ref.tenant is not None and ref.tenant != consumer_tenant:
+                continue
             if ref.display() in existing:
                 continue
-            edge = DependencyEdge(source=source, target=ref, relation="uses", actor=principal.name)
+            target = ref.model_copy(update={"tenant": consumer_tenant})
+            edge = DependencyEdge(source=source, target=target, relation="uses", actor=principal.name)
             self.store.add_edge(edge)
             await self._emit(
                 ControlEventType.LINEAGE_EDGE,
                 principal,
                 resource=artifact.resource_key(),
-                tenant=artifact.metadata.tenant,
-                details={"from": source.display(), "to": ref.display(), "relation": "uses"},
+                tenant=consumer_tenant,
+                details={"from": source.display(), "to": target.display(), "relation": "uses"},
             )
 
-    async def _missing_dependencies(self, artifact: AgentArtifact) -> list[AssetRef]:
+    async def _missing_dependencies(
+        self, artifact: AgentArtifact, principal: Principal
+    ) -> list[AssetRef]:
         missing: list[AssetRef] = []
         tenant = artifact.metadata.tenant
         for ref in artifact.spec.dependency_refs():
-            found = self.store.get_asset(ref.kind, ref.tenant or tenant, ref.name, ref.version)
+            if ref.tenant is not None and ref.tenant != tenant:
+                raise AuthorizationError(
+                    f"tenant {principal.tenant!r} cannot read {ref.display()} owned by tenant {ref.tenant!r}"
+                )
+            found = self.store.get_asset(ref.kind, tenant, ref.name, ref.version)
             if found is None:
                 missing.append(ref)
+                continue
+            assert_can_read(principal, found.metadata, resource=ref.display())
         return missing
 
-    async def _bind_runtime(self, artifact: AgentArtifact, deployment: DeploymentRecord) -> None:
+    async def _bind_runtime(
+        self, artifact: AgentArtifact, deployment: DeploymentRecord, principal: Principal
+    ) -> None:
         if self.runtime is None:
             return
-        prompt = await self._system_prompt_for(artifact)
+        prompt = await self._system_prompt_for(artifact, principal)
         binding = DeploymentBinding(
             deployment_id=deployment.deployment_id,
             agent_name=deployment.agent_name,
@@ -828,13 +881,18 @@ class ControlPlane:
         )
         await self.runtime.bind_deployment(binding)
 
-    async def _system_prompt_for(self, artifact: AgentArtifact) -> str:
+    async def _system_prompt_for(self, artifact: AgentArtifact, principal: Principal) -> str:
         parts: list[str] = []
         tenant = artifact.metadata.tenant
         for ref in artifact.spec.prompts:
-            record = self.store.get_asset(ref.kind, ref.tenant or tenant, ref.name, ref.version)
+            if ref.tenant is not None and ref.tenant != tenant:
+                raise AuthorizationError(
+                    f"tenant {principal.tenant!r} cannot read {ref.display()} owned by tenant {ref.tenant!r}"
+                )
+            record = self.store.get_asset(ref.kind, tenant, ref.name, ref.version)
             if record is None:
                 continue
+            assert_can_read(principal, record.metadata, resource=ref.display())
             text = record.spec.get("text") or record.spec.get("template") or ""
             if text:
                 parts.append(str(text))
@@ -864,15 +922,20 @@ class ControlPlane:
     def _version_was_full(
         self, *, tenant: str, name: str, version: str, environment: str
     ) -> bool:
-        artifact = self.store.get_artifact(tenant, name, version)
-        if artifact is not None and artifact.status.releaseChannel is ReleaseChannel.FULL:
-            return True
         return any(
             d.agent_version == version and d.channel is ReleaseChannel.FULL
             for d in self.store.list_deployments(
                 tenant=tenant, name=name, environment=environment
             )
         )
+
+    def _assert_experiment_tenant(self, run: Any, tenant: str, run_id: str) -> None:
+        spec = getattr(run, "spec", None)
+        run_tenant = getattr(spec, "tenant", None) or ""
+        if run_tenant != tenant:
+            raise AuthorizationError(
+                f"tenant {tenant!r} cannot use experiment run {run_id} owned by tenant {run_tenant!r}"
+            )
 
     def _load_stored_gate(self, artifact: AgentArtifact, *, gate_id: str | None) -> GateDecision:
         latest = artifact.status.lastGateResultId
@@ -890,7 +953,7 @@ class ControlPlane:
         ref = record.ref()
         return any(
             edge.relation == "evaluates"
-            for edge in self.store.list_edges(target=ref.key(record.tenant))
+            for edge in self.store.list_edges(target=ref.exact_key())
         )
 
     def mark_immutable(self, kind: AssetKind, tenant: str, name: str, version: str) -> AssetRecord | None:

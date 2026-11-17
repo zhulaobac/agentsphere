@@ -210,3 +210,47 @@ async def test_stale_same_version_gate_id_is_rejected(principal: Principal) -> N
     assert still.status.deployedVersions == []
     assert still.status.lastGateResultId == latest_id
     assert still.status.lastExperimentRunId == "exp-pass"
+
+
+class _MutableExperiment:
+    def __init__(self, inner: object) -> None:
+        self.run_id = inner.run_id  # type: ignore[attr-defined]
+        self.spec = inner.spec  # type: ignore[attr-defined]
+        self.summary = inner.summary  # type: ignore[attr-defined]
+        self.cases = inner.cases  # type: ignore[attr-defined]
+        self.created_at = getattr(inner, "created_at", None)
+        self.agent_fingerprint = getattr(inner, "agent_fingerprint", None)
+        self.dataset_content_hash = getattr(inner, "dataset_content_hash", None)
+
+
+async def test_mutable_experiment_standin_cannot_pass_gate(principal: Principal) -> None:
+    cp = ControlPlane()
+    await ready_draft(cp, principal)
+    await cp.build("bot", "0.1.0", principal)
+    failing = stub_experiment_run(
+        "exp-mut", "bot", "0.1.0", pass_rate=0.0, safety_failed=True, tenant=principal.tenant
+    )
+    standin = _MutableExperiment(failing)
+    try:
+        cp.register_experiment(standin)
+    except LifecycleError:
+        cp.register_experiment(failing)
+    else:
+        standin.summary.pass_rate = 1.0
+        standin.cases[0].samples[0].passed = True
+        standin.cases[0].samples[0].result.passed = True
+        standin.cases[0].samples[0].result.score = 1.0
+        if len(standin.cases) > 1:
+            standin.cases[1].samples[0].passed = True
+    stored = cp.get_experiment("exp-mut")
+    assert stored is not None
+    assert stored.summary.pass_rate < 1.0
+    await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp-mut")
+    await cp.approve("bot", "0.1.0", principal)
+    _, decision = await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-mut")
+    assert decision.passed is False
+    with pytest.raises(GateFailedError):
+        await cp.release("bot", "0.1.0", principal)
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.APPROVED
+    assert still.status.deployedVersions == []

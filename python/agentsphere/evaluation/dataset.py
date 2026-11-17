@@ -127,7 +127,7 @@ class DatasetService:
         if store is None:
             return False
         ref = AssetRef(kind=AssetKind.DATASET, name=name, version=version, tenant=tenant)
-        used = self.control.store.list_edges(target=ref.key(tenant))
+        used = self.control.store.list_edges(target=ref.exact_key())
         return any(e.relation == "evaluates" for e in used)
 
     def _record_source_edges(self, dataset: DatasetVersion, principal: Principal) -> None:

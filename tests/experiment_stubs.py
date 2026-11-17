@@ -20,6 +20,7 @@ def stub_experiment_run(
     *,
     pass_rate: float = 1.0,
     safety_failed: bool = False,
+    tenant: str = "acme",
 ) -> ExperimentRun:
     quality_passed = pass_rate >= 1.0
     cases = [
@@ -66,6 +67,7 @@ def stub_experiment_run(
             dataset_version="1.0.0",
             evaluator_name="rule-assertion",
             evaluator_version="0.1.0",
+            tenant=tenant,
         ),
         summary=ExperimentSummary(
             n_cases=n,

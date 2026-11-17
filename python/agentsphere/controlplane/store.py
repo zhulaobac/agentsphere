@@ -192,9 +192,9 @@ class InMemoryControlStore(ControlStore):
     ) -> list[DependencyEdge]:
         items = [e.model_copy(deep=True) for e in self._edges]
         if source is not None:
-            items = [e for e in items if e.source.key(source[1]) == source]
+            items = [e for e in items if e.source.exact_key() == source]
         if target is not None:
-            items = [e for e in items if e.target.key(target[1]) == target]
+            items = [e for e in items if e.target.exact_key() == target]
         return items
 
     def append_event(self, event: ControlEvent) -> ControlEvent:

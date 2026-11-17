@@ -82,6 +82,9 @@ class AssetRef(BaseModel):
     def key(self, default_tenant: str = "") -> tuple[str, str, str, str]:
         return (self.kind.value, self.tenant or default_tenant, self.name, self.version)
 
+    def exact_key(self) -> tuple[str, str, str, str]:
+        return (self.kind.value, self.tenant or "", self.name, self.version)
+
     def display(self) -> str:
         return f"{self.kind.value}/{self.name}@{self.version}"
 

@@ -34,9 +34,10 @@ class ExperimentSpec(BaseModel):
     evaluator_version: str
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     samples: int = 1
+    tenant: str = ""
 
     def fingerprint(self) -> str:
-        payload = self.model_dump(mode="json")
+        payload = self.model_dump(mode="json", exclude={"tenant"})
         encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
@@ -240,6 +241,13 @@ class ExperimentRunner:
     ) -> ExperimentRun:
         if spec.samples < 1:
             raise ValueError("samples must be >= 1")
+        if spec.tenant and spec.tenant != principal.tenant:
+            from agentsphere.controlplane.errors import AuthorizationError
+
+            raise AuthorizationError(
+                f"tenant {principal.tenant!r} cannot run experiment for tenant {spec.tenant!r}"
+            )
+        spec = spec if spec.tenant else spec.model_copy(update={"tenant": principal.tenant})
         artifact = await self.control.get_artifact(spec.agent_name, spec.agent_version, principal)
         dataset = await self.datasets.get(spec.dataset_name, spec.dataset_version, principal)
         ev = evaluator or self.evaluators.get(spec.evaluator_name, spec.evaluator_version)

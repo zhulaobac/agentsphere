@@ -312,3 +312,58 @@ async def test_release_channel_string_full_raises_lifecycle_error(principal: Pri
     still = await cp.get_artifact("bot", "0.1.0", principal)
     assert still.status.phase is LifecyclePhase.APPROVED
     assert still.status.deployedVersions == []
+
+
+async def test_rollback_into_new_environment_is_not_full(principal: Principal) -> None:
+    cp = ControlPlane()
+    await _ship(cp, principal, version="0.1.0")
+    await cp.promote("bot", "0.1.0", principal)
+    restored, dep = await cp.rollback(
+        "bot", principal, to_version="0.1.0", environment="prod"
+    )
+    assert dep.environment == "prod"
+    assert dep.channel is ReleaseChannel.CANARY
+    assert dep.weight == CANARY_WEIGHT
+    prod = [
+        d
+        for d in cp.store.list_deployments(
+            tenant=principal.tenant, name="bot", environment="prod"
+        )
+        if d.status is DeploymentStatus.ACTIVE
+    ]
+    assert prod
+    assert all(d.channel is ReleaseChannel.CANARY for d in prod)
+    assert all(d.weight < 1.0 for d in prod)
+    default_full = [
+        d
+        for d in cp.store.list_deployments(
+            tenant=principal.tenant, name="bot", environment="default"
+        )
+        if d.status is DeploymentStatus.ACTIVE and d.channel is ReleaseChannel.FULL
+    ]
+    assert default_full
+    assert restored.status.phase is LifecyclePhase.RELEASED
+
+
+async def test_rollback_spoofed_from_version_cannot_skip_canary_guard(principal: Principal) -> None:
+    cp = ControlPlane()
+    await _ship(cp, principal, version="0.1.0")
+    with pytest.raises(LifecycleError, match="promote"):
+        await cp.rollback(
+            "bot",
+            principal,
+            to_version="0.1.0",
+            from_version="9.9.9",
+            reason="spoofed from_version",
+        )
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.RELEASED
+    assert still.status.releaseChannel is ReleaseChannel.CANARY
+    active = [
+        d
+        for d in cp.store.list_deployments(tenant=principal.tenant, name="bot")
+        if d.status is DeploymentStatus.ACTIVE
+    ]
+    assert active
+    assert all(d.channel is ReleaseChannel.CANARY for d in active)
+    assert all(d.status is not DeploymentStatus.ROLLED_BACK for d in active)
