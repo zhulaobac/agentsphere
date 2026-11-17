@@ -28,7 +28,7 @@ from agentsphere.kernel import (
     SessionState,
     WorkflowStrategy,
 )
-from agentsphere.model_adapter import MockModelProvider, ModelAdapter
+from agentsphere.model_adapter import MockModelProvider, ModelAdapter, OpenAICompatibleProvider
 from agentsphere.runtime import SessionRuntime, WorkerLease, build_runtime
 from agentsphere.sandbox import SandboxSpec, SubprocessSandbox
 from agentsphere.tenants import TenantRegistry
@@ -61,6 +61,7 @@ __all__ = [
     "LoopStrategy",
     "MockModelProvider",
     "ModelAdapter",
+    "OpenAICompatibleProvider",
     "ReActStrategy",
     "SandboxSpec",
     "SessionRuntime",

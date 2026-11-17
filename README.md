@@ -15,12 +15,18 @@ versioned assets, lifecycle, canary/full release, rollback, tenant scoping,
 Managed Runtime Provider) and the Evaluation foundation (datasets, pluggable
 evaluators, Experiment, regression, Release Gate).
 
-P1 third slice (this tree) onboards the first Anchor Tenant: **product-team**
+P1 third slice onboards the first Anchor Tenant: **product-team**
 (display name 产品团队). Its first workflow is requirements research and
 competitive analysis (需求调研和竞品分析). A later second tenant should
 implement the same `TenantPack` interface. Memory/RAG, MCP Gateway,
 Planner-Executor, Multi-Agent, BYO hosting, cost governance, online sampling,
 the evolver, and a second production Anchor Tenant remain out of scope.
+
+This tree also adds an OpenAI-compatible Chat Completions `ModelProvider` behind
+the existing `ModelAdapter`. It is **off by default**. CI and official tests stay
+offline (scripted HTTP transport or a loopback fake server). Do not put API keys
+in env, git, events, traces, or model context; load them from the Credential
+Vault at call time.
 
 ## Layout
 
@@ -28,7 +34,7 @@ the evolver, and a second production Anchor Tenant remain out of scope.
 python/agentsphere/          # Python packages (Kernel + Runtime + security + P1 CP/Eval)
   kernel/                    # Harness: loop, context, dispatcher, middleware, events
     loop/                    # ReAct + Workflow strategies; extension registry
-  model_adapter/             # Unified model API + mock provider (no network)
+  model_adapter/             # Unified model API + mock + OpenAI-compatible provider (live off)
   runtime/                   # Session/Turn/Event, Checkpoint, Worker lease, recovery
   tool_registry/             # Tool Registry v1 (schema, SemVer, owner, risk, idempotency)
   trace/                     # Session → Turn → Step → Model/Tool Call (OpenTelemetry)
@@ -78,6 +84,7 @@ pytest tests/test_controlplane_artifacts.py tests/test_lifecycle.py \
        tests/test_gate.py tests/test_ci_gate.py                          # P1 CP + Eval
 pytest tests/test_product_team_tenant.py tests/test_product_team_isolation.py
                                                                          # P1 first Anchor Tenant
+pytest tests/test_openai_compat_provider.py                       # OpenAI-compatible provider (offline)
 python -m agentsphere.evaluation.ci_gate                          # fixture Release Gate
 python -m agentsphere.tenants.product_team.ci                     # product-team canary → Full
 ```
@@ -86,6 +93,47 @@ CI runs `pytest` then `python -m agentsphere.evaluation.ci_gate` on `main` and
 on pull requests, and prints sandbox capability probe output (user/net
 namespaces, Landlock). Sandbox tests that need those capabilities skip with a
 clear reason when they are genuinely absent.
+
+### OpenAI-compatible model provider (optional, default off)
+
+`ModelAdapter` still talks only to `ModelProvider`. Official tests use
+`MockModelProvider` or `OpenAICompatibleProvider` with `ScriptedHttpTransport`
+(no sockets) / a loopback fake server. They never call a paid vendor.
+
+To point a **local** smoke run at OpenAI or any Chat Completions-compatible
+vendor (Chinese or otherwise), keep the API key in the Credential Vault and set:
+
+| Setting | Example |
+|---|---|
+| `AGENTSPHERE_MODEL_PROVIDER` | `openai-compat` (unset or `mock` in CI) |
+| `AGENTSPHERE_OPENAI_BASE_URL` | `https://api.openai.com/v1` or another vendor's compatible `/v1` |
+| `AGENTSPHERE_OPENAI_MODEL` | vendor model id |
+| `AGENTSPHERE_OPENAI_SECRET_NAME` | vault secret **name** (not the key) |
+
+```python
+from agentsphere.identity import AgentIdentity, InMemoryVault
+from agentsphere.model_adapter import ModelAdapter, resolve_model_provider
+
+identity = AgentIdentity(name="smoke-agent")
+vault = InMemoryVault()
+await vault.put("openai_api_key", api_key, agent_id=identity.agent_id)
+
+# allow_network=True is required for a public vendor. Never set this in CI.
+provider = resolve_model_provider(
+    vault=vault,
+    agent_id=identity.agent_id,
+    allow_network=True,
+)
+adapter = ModelAdapter(provider)
+```
+
+A missing key, empty or whitespace-only key, missing base URL/model, or a live
+provider without an injected transport / `allow_network=True` **fails closed**.
+Do not commit keys, `.env` files, or sample tokens that look real. Base URLs
+must not include userinfo or secret query parameters (`api_key`, `access_token`,
+`authorization`, …). `StdlibHttpTransport` refuses non-loopback hosts unless
+`allow_public_network=True`, does not follow HTTP redirects, and does not honor
+`HTTP_PROXY` / `HTTPS_PROXY` in loopback-only mode.
 
 ### Sandbox backend notes (ubuntu-latest)
 
@@ -103,7 +151,8 @@ from agentsphere import (
     ReActStrategy,         # LoopStrategy.step(ctx) → CallModel | CallTool | Finish | Handoff
     WorkflowStrategy,
     ModelAdapter,
-    MockModelProvider,
+    MockModelProvider,     # default / CI
+    OpenAICompatibleProvider,  # Chat Completions; vault key + injected HTTP; default off
     SessionRuntime,        # run_turn / resume / pause_session / cancel_session / acquire_lease
     ToolRegistry,
     TraceRecorder,
