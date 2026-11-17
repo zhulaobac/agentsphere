@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any, Protocol
 
 from jsonschema import Draft202012Validator
@@ -110,10 +111,12 @@ class ToolDispatcher:
         recovery: bool = False,
         in_flight_keys: set[str] | None = None,
         confirm_commit: bool = False,
+        confirm_keys: set[str] | None = None,
         agent_id: str = "",
     ) -> list[ToolResult]:
         semaphore = asyncio.Semaphore(self.config.max_concurrency)
         in_flight = set(in_flight_keys or ())
+        allowed_keys = set(confirm_keys or ())
 
         async def one(call: ToolCallRequest, index: int) -> ToolResult:
             async with semaphore:
@@ -127,6 +130,7 @@ class ToolDispatcher:
                     recovery=recovery,
                     in_flight=in_flight,
                     confirm_commit=confirm_commit,
+                    confirm_keys=allowed_keys,
                     agent_id=agent_id,
                 )
 
@@ -159,6 +163,7 @@ class ToolDispatcher:
         recovery: bool,
         in_flight: set[str],
         confirm_commit: bool,
+        confirm_keys: set[str],
         agent_id: str,
     ) -> ToolResult:
         key = idempotency_key(session_id, turn_id, step_index, index, call)
@@ -172,7 +177,8 @@ class ToolDispatcher:
             idempotency_key=key,
             recovery=recovery,
             in_flight=key in in_flight,
-            confirm_commit=confirm_commit,
+            confirm_commit=confirm_commit or key in confirm_keys,
+            confirm_keys=confirm_keys,
         )
         token = bind_invocation(invocation)
         try:
@@ -186,6 +192,9 @@ class ToolDispatcher:
         key: str,
         invocation: InvocationContext,
     ) -> ToolResult:
+        granted = self._is_granted(invocation)
+        if granted:
+            invocation.confirm_commit = True
         cached = await self._cache_lookup(key)
         if cached is not None:
             prepare_waiting_commit = cached.phase == "prepare" and invocation.confirm_commit
@@ -197,7 +206,17 @@ class ToolDispatcher:
         except Exception as exc:  # noqa: BLE001
             return ToolResult(call_id=call.id, name=call.name, error=str(exc), idempotency_key=key)
 
-        if invocation.recovery and invocation.in_flight and not _is_idempotent(tool):
+        pending_prepare_commit = (
+            cached is not None and cached.phase == "prepare" and invocation.confirm_commit
+        )
+        # HITL grant or two-phase confirm must run (or commit), not skip as a duplicate side effect.
+        if (
+            invocation.recovery
+            and invocation.in_flight
+            and not _is_idempotent(tool)
+            and not granted
+            and not pending_prepare_commit
+        ):
             result = ToolResult(
                 call_id=call.id,
                 name=call.name,
@@ -307,6 +326,7 @@ class ToolDispatcher:
             )
 
         text, truncated = _truncate(_stringify(after), self.config.max_result_chars)
+        text = self._redact_text(text)
         result = ToolResult(
             call_id=call.id,
             name=call.name,
@@ -373,8 +393,20 @@ class ToolDispatcher:
         os.write(secret_w, json.dumps(secrets).encode("utf-8"))
         os.close(secret_w)
         secrets.clear()
+        extra_readable = [sys.prefix, str(Path(sys.executable).resolve().parent)]
         try:
-            sandbox_spec = SandboxSpec(working_directory=self.workspace_path)
+            import agentsphere as _as
+
+            extra_readable.append(str(Path(_as.__file__).resolve().parent.parent))
+        except Exception:
+            pass
+        extra_readable.extend(p for p in sys.path if p and Path(p).exists())
+        try:
+            sandbox_spec = SandboxSpec(
+                working_directory=self.workspace_path,
+                restrict_filesystem=True,
+                extra_readable_paths=extra_readable,
+            )
             result = await self.sandbox.run(
                 [sys.executable, "-m", "agentsphere.sandbox.worker"],
                 sandbox_spec,
@@ -402,6 +434,34 @@ class ToolDispatcher:
         agent_id = invocation.agent_id or getattr(self.identity, "agent_id", "")
         issued = await self.vault.issue(names[0], agent_id=agent_id)
         return issued, bind_issued_credential(issued)
+
+    def _is_granted(self, invocation: InvocationContext) -> bool:
+        if invocation.confirm_commit:
+            return True
+        if invocation.confirm_keys and invocation.idempotency_key in invocation.confirm_keys:
+            return True
+        if self.approvals is None:
+            return False
+        record = self.approvals.decision_for(
+            session_id=invocation.session_id,
+            idempotency_key=invocation.idempotency_key,
+        )
+        return record is not None and record.status == "granted"
+
+    def _redact_text(self, text: str) -> str:
+        if not text:
+            return text
+        secrets: set[str] = set()
+        if self.vault is not None:
+            lookup = getattr(self.vault, "known_plaintext_secrets", None)
+            if callable(lookup):
+                secrets |= set(lookup() or ())
+        if not secrets:
+            return text
+        from agentsphere.identity.redact import redact
+
+        redacted = redact(text, extra_secrets=secrets)
+        return redacted if isinstance(redacted, str) else text
 
     async def _enforce_approval(self, call: ToolCallRequest, invocation: InvocationContext) -> None:
         record = self.approvals.decision_for(

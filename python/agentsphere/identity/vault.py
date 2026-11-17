@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -85,6 +86,18 @@ class InMemoryVault:
         self._clock = clock or _RealClock()
         self._secrets: dict[str, StoredSecret] = {}
         self._issued: dict[str, tuple[IssuedCredential, str, datetime]] = {}
+        self._sinks: list[Callable[[str], None]] = []
+
+    def add_sink(self, sink: Callable[[str], None]) -> None:
+        self._sinks.append(sink)
+        for stored in self._secrets.values():
+            sink(stored.secret)
+
+    def _enroll(self, secret: str) -> None:
+        if not secret:
+            return
+        for sink in self._sinks:
+            sink(secret)
 
     async def put(
         self,
@@ -105,6 +118,7 @@ class InMemoryVault:
             credential_id=new_id("cred"),
         )
         self._secrets[name] = stored
+        self._enroll(secret)
         return CredentialHandle(
             credential_id=stored.credential_id,
             name=name,
@@ -142,6 +156,7 @@ class InMemoryVault:
         )
         issued = IssuedCredential(handle=handle, token=token, secret_name=name)
         self._issued[token] = (issued, stored.secret, handle.expires_at)
+        self._enroll(stored.secret)
         return issued
 
     async def reveal(self, token: str) -> str:

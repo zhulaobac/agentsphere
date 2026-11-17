@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -30,7 +31,13 @@ class EventStore(ABC):
     async def update_session(self, session: Session) -> None: ...
 
     @abstractmethod
-    async def append_event(self, event: Event) -> Event: ...
+    async def append_event(
+        self,
+        event: Event,
+        *,
+        worker_id: str | None = None,
+        token: int | None = None,
+    ) -> Event: ...
 
     @abstractmethod
     async def list_events(self, session_id: str, *, after_seq: int | None = None) -> list[Event]: ...
@@ -104,6 +111,7 @@ class InMemoryEventStore(EventStore):
         self._checkpoint_by_id: dict[str, Checkpoint] = {}
         self._results: dict[str, CachedResult] = {}
         self._leases: dict[str, WorkerLease] = {}
+        self._lock = threading.Lock()
 
     async def create_session(self, session: Session) -> None:
         self._sessions[session.session_id] = session.model_copy(deep=True)
@@ -115,11 +123,19 @@ class InMemoryEventStore(EventStore):
     async def update_session(self, session: Session) -> None:
         self._sessions[session.session_id] = session.model_copy(deep=True)
 
-    async def append_event(self, event: Event) -> Event:
-        seq = len(self._events[event.session_id]) + 1
-        stored = event.model_copy(update={"seq": seq})
-        self._events[event.session_id].append(stored)
-        return stored
+    async def append_event(
+        self,
+        event: Event,
+        *,
+        worker_id: str | None = None,
+        token: int | None = None,
+    ) -> Event:
+        with self._lock:
+            _require_matching_lease(self._leases.get(event.session_id), event.session_id, worker_id, token)
+            seq = len(self._events[event.session_id]) + 1
+            stored = event.model_copy(update={"seq": seq})
+            self._events[event.session_id].append(stored)
+            return stored
 
     async def list_events(self, session_id: str, *, after_seq: int | None = None) -> list[Event]:
         events = [e.model_copy(deep=True) for e in self._events.get(session_id, [])]
@@ -171,24 +187,25 @@ class InMemoryEventStore(EventStore):
         now: datetime | None = None,
     ) -> WorkerLease:
         now = now or self._clock.now()
-        current = self._leases.get(session_id)
-        if current is not None and not current.released and current.expires_at > now:
-            if current.worker_id == worker_id:
-                current.heartbeat_at = now
-                current.expires_at = compute_expiry(now, ttl_seconds)
-                return current.model_copy(deep=True)
-            raise LeaseHeldError(current)
-        token = (current.token + 1) if current is not None else 1
-        lease = WorkerLease(
-            session_id=session_id,
-            worker_id=worker_id,
-            token=token,
-            acquired_at=now,
-            heartbeat_at=now,
-            expires_at=compute_expiry(now, ttl_seconds),
-        )
-        self._leases[session_id] = lease
-        return lease.model_copy(deep=True)
+        with self._lock:
+            current = self._leases.get(session_id)
+            if current is not None and not current.released and current.expires_at > now:
+                if current.worker_id == worker_id:
+                    current.heartbeat_at = now
+                    current.expires_at = compute_expiry(now, ttl_seconds)
+                    return current.model_copy(deep=True)
+                raise LeaseHeldError(current)
+            token = (current.token + 1) if current is not None else 1
+            lease = WorkerLease(
+                session_id=session_id,
+                worker_id=worker_id,
+                token=token,
+                acquired_at=now,
+                heartbeat_at=now,
+                expires_at=compute_expiry(now, ttl_seconds),
+            )
+            self._leases[session_id] = lease
+            return lease.model_copy(deep=True)
 
     async def heartbeat_lease(
         self,
@@ -200,18 +217,19 @@ class InMemoryEventStore(EventStore):
         now: datetime | None = None,
     ) -> WorkerLease:
         now = now or self._clock.now()
-        current = self._leases.get(session_id)
-        if (
-            current is None
-            or current.released
-            or current.worker_id != worker_id
-            or current.token != token
-            or current.expires_at <= now
-        ):
-            raise StaleLeaseError(session_id, worker_id, token)
-        current.heartbeat_at = now
-        current.expires_at = compute_expiry(now, ttl_seconds)
-        return current.model_copy(deep=True)
+        with self._lock:
+            current = self._leases.get(session_id)
+            if (
+                current is None
+                or current.released
+                or current.worker_id != worker_id
+                or current.token != token
+                or current.expires_at <= now
+            ):
+                raise StaleLeaseError(session_id, worker_id, token)
+            current.heartbeat_at = now
+            current.expires_at = compute_expiry(now, ttl_seconds)
+            return current.model_copy(deep=True)
 
     async def release_lease(
         self,
@@ -222,13 +240,14 @@ class InMemoryEventStore(EventStore):
         now: datetime | None = None,
     ) -> None:
         del now
-        current = self._leases.get(session_id)
-        if current is None:
-            return
-        if current.worker_id != worker_id or current.token != token:
-            raise StaleLeaseError(session_id, worker_id, token)
-        current.released = True
-        current.expires_at = datetime.fromtimestamp(0, tz=timezone.utc)
+        with self._lock:
+            current = self._leases.get(session_id)
+            if current is None:
+                return
+            if current.worker_id != worker_id or current.token != token:
+                raise StaleLeaseError(session_id, worker_id, token)
+            current.released = True
+            current.expires_at = datetime.fromtimestamp(0, tz=timezone.utc)
 
     async def get_lease(self, session_id: str) -> WorkerLease | None:
         lease = self._leases.get(session_id)
@@ -241,8 +260,10 @@ class SqliteEventStore(EventStore):
     def __init__(self, path: str | Path = ":memory:", clock: Clock | None = None) -> None:
         self._path = str(path)
         self._clock = clock or RealClock()
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        # autocommit so BEGIN IMMEDIATE is the only transaction around lease+insert
+        self._conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
         self._init()
 
     def _init(self) -> None:
@@ -363,19 +384,37 @@ class SqliteEventStore(EventStore):
         )
         self._conn.commit()
 
-    async def append_event(self, event: Event) -> Event:
-        row = self._conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) AS m FROM events WHERE session_id = ?",
-            (event.session_id,),
-        ).fetchone()
-        seq = int(row["m"]) + 1
-        stored = event.model_copy(update={"seq": seq})
-        self._conn.execute(
-            "INSERT INTO events (event_id, session_id, seq, body_json) VALUES (?, ?, ?, ?)",
-            (stored.event_id, stored.session_id, seq, stored.model_dump_json()),
-        )
-        self._conn.commit()
-        return stored
+    async def append_event(
+        self,
+        event: Event,
+        *,
+        worker_id: str | None = None,
+        token: int | None = None,
+    ) -> Event:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT * FROM leases WHERE session_id = ?", (event.session_id,)).fetchone()
+                lease = _lease_from_row(row) if row else None
+                _require_matching_lease(lease, event.session_id, worker_id, token)
+                seq_row = self._conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS m FROM events WHERE session_id = ?",
+                    (event.session_id,),
+                ).fetchone()
+                seq = int(seq_row["m"]) + 1
+                stored = event.model_copy(update={"seq": seq})
+                self._conn.execute(
+                    "INSERT INTO events (event_id, session_id, seq, body_json) VALUES (?, ?, ?, ?)",
+                    (stored.event_id, stored.session_id, seq, stored.model_dump_json()),
+                )
+                self._conn.commit()
+                return stored
+            except StaleLeaseError:
+                self._conn.rollback()
+                raise
+            except Exception:
+                self._conn.rollback()
+                raise
 
     async def list_events(self, session_id: str, *, after_seq: int | None = None) -> list[Event]:
         if after_seq is None:
@@ -511,36 +550,37 @@ class SqliteEventStore(EventStore):
         now: datetime | None = None,
     ) -> WorkerLease:
         now = now or self._clock.now()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute("SELECT * FROM leases WHERE session_id = ?", (session_id,)).fetchone()
-            current = _lease_from_row(row) if row else None
-            if current is not None and not current.released and current.expires_at > now:
-                if current.worker_id == worker_id:
-                    current.heartbeat_at = now
-                    current.expires_at = compute_expiry(now, ttl_seconds)
-                    _write_lease(self._conn, current)
-                    self._conn.commit()
-                    return current
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT * FROM leases WHERE session_id = ?", (session_id,)).fetchone()
+                current = _lease_from_row(row) if row else None
+                if current is not None and not current.released and current.expires_at > now:
+                    if current.worker_id == worker_id:
+                        current.heartbeat_at = now
+                        current.expires_at = compute_expiry(now, ttl_seconds)
+                        _write_lease(self._conn, current)
+                        self._conn.commit()
+                        return current
+                    self._conn.rollback()
+                    raise LeaseHeldError(current)
+                token = (current.token + 1) if current is not None else 1
+                lease = WorkerLease(
+                    session_id=session_id,
+                    worker_id=worker_id,
+                    token=token,
+                    acquired_at=now,
+                    heartbeat_at=now,
+                    expires_at=compute_expiry(now, ttl_seconds),
+                )
+                _write_lease(self._conn, lease)
+                self._conn.commit()
+                return lease
+            except LeaseHeldError:
+                raise
+            except Exception:
                 self._conn.rollback()
-                raise LeaseHeldError(current)
-            token = (current.token + 1) if current is not None else 1
-            lease = WorkerLease(
-                session_id=session_id,
-                worker_id=worker_id,
-                token=token,
-                acquired_at=now,
-                heartbeat_at=now,
-                expires_at=compute_expiry(now, ttl_seconds),
-            )
-            _write_lease(self._conn, lease)
-            self._conn.commit()
-            return lease
-        except LeaseHeldError:
-            raise
-        except Exception:
-            self._conn.rollback()
-            raise
+                raise
 
     async def heartbeat_lease(
         self,
@@ -552,29 +592,30 @@ class SqliteEventStore(EventStore):
         now: datetime | None = None,
     ) -> WorkerLease:
         now = now or self._clock.now()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute("SELECT * FROM leases WHERE session_id = ?", (session_id,)).fetchone()
-            current = _lease_from_row(row) if row else None
-            if (
-                current is None
-                or current.released
-                or current.worker_id != worker_id
-                or current.token != token
-                or current.expires_at <= now
-            ):
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT * FROM leases WHERE session_id = ?", (session_id,)).fetchone()
+                current = _lease_from_row(row) if row else None
+                if (
+                    current is None
+                    or current.released
+                    or current.worker_id != worker_id
+                    or current.token != token
+                    or current.expires_at <= now
+                ):
+                    self._conn.rollback()
+                    raise StaleLeaseError(session_id, worker_id, token)
+                current.heartbeat_at = now
+                current.expires_at = compute_expiry(now, ttl_seconds)
+                _write_lease(self._conn, current)
+                self._conn.commit()
+                return current
+            except StaleLeaseError:
+                raise
+            except Exception:
                 self._conn.rollback()
-                raise StaleLeaseError(session_id, worker_id, token)
-            current.heartbeat_at = now
-            current.expires_at = compute_expiry(now, ttl_seconds)
-            _write_lease(self._conn, current)
-            self._conn.commit()
-            return current
-        except StaleLeaseError:
-            raise
-        except Exception:
-            self._conn.rollback()
-            raise
+                raise
 
     async def release_lease(
         self,
@@ -585,25 +626,26 @@ class SqliteEventStore(EventStore):
         now: datetime | None = None,
     ) -> None:
         del now
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute("SELECT * FROM leases WHERE session_id = ?", (session_id,)).fetchone()
-            if row is None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT * FROM leases WHERE session_id = ?", (session_id,)).fetchone()
+                if row is None:
+                    self._conn.commit()
+                    return
+                current = _lease_from_row(row)
+                if current.worker_id != worker_id or current.token != token:
+                    self._conn.rollback()
+                    raise StaleLeaseError(session_id, worker_id, token)
+                current.released = True
+                current.expires_at = datetime.fromtimestamp(0, tz=timezone.utc)
+                _write_lease(self._conn, current)
                 self._conn.commit()
-                return
-            current = _lease_from_row(row)
-            if current.worker_id != worker_id or current.token != token:
+            except StaleLeaseError:
+                raise
+            except Exception:
                 self._conn.rollback()
-                raise StaleLeaseError(session_id, worker_id, token)
-            current.released = True
-            current.expires_at = datetime.fromtimestamp(0, tz=timezone.utc)
-            _write_lease(self._conn, current)
-            self._conn.commit()
-        except StaleLeaseError:
-            raise
-        except Exception:
-            self._conn.rollback()
-            raise
+                raise
 
     async def get_lease(self, session_id: str) -> WorkerLease | None:
         row = self._conn.execute("SELECT * FROM leases WHERE session_id = ?", (session_id,)).fetchone()
@@ -611,6 +653,19 @@ class SqliteEventStore(EventStore):
 
     def close(self) -> None:
         self._conn.close()
+
+
+def _require_matching_lease(
+    lease: WorkerLease | None,
+    session_id: str,
+    worker_id: str | None,
+    token: int | None,
+) -> None:
+    """Reject appends that do not present the current unreleased lease token."""
+    if lease is None or lease.released:
+        return
+    if worker_id is None or token is None or lease.worker_id != worker_id or lease.token != token:
+        raise StaleLeaseError(session_id, worker_id or "", token)
 
 
 def _lease_from_row(row: sqlite3.Row) -> WorkerLease:

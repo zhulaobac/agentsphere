@@ -13,7 +13,7 @@ from agentsphere.identity.policy import (
     PolicyRule,
     StaticPolicyEngine,
 )
-from agentsphere.identity.redact import REDACTED, contains_secret, redact
+from agentsphere.identity.redact import REDACTED, RedactingListener, contains_secret, redact
 from agentsphere.identity.vault import (
     CredentialHandle,
     InMemoryVault,
@@ -43,6 +43,7 @@ __all__ = [
     "PolicyRequest",
     "PolicyRule",
     "REDACTED",
+    "RedactingListener",
     "StaticPolicyEngine",
     "Vault",
     "VaultError",

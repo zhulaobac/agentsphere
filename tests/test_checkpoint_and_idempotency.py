@@ -27,10 +27,12 @@ class CrashOnCompleteStore(InMemoryEventStore):
         super().__init__(clock=clock)
         self.crash_on_complete = True
 
-    async def append_event(self, event: Event) -> Event:
+    async def append_event(
+        self, event: Event, *, worker_id: str | None = None, token: int | None = None
+    ) -> Event:
         if self.crash_on_complete and event.type is EventType.TOOL_CALL_COMPLETED:
             raise WorkerCrash("worker died after the tool ran but before the completed event was stored")
-        return await super().append_event(event)
+        return await super().append_event(event, worker_id=worker_id, token=token)
 
 
 class CrashOnStartStore(InMemoryEventStore):
@@ -40,8 +42,10 @@ class CrashOnStartStore(InMemoryEventStore):
         super().__init__(clock=clock)
         self.crash_on_start = True
 
-    async def append_event(self, event: Event) -> Event:
-        stored = await super().append_event(event)
+    async def append_event(
+        self, event: Event, *, worker_id: str | None = None, token: int | None = None
+    ) -> Event:
+        stored = await super().append_event(event, worker_id=worker_id, token=token)
         if self.crash_on_start and event.type is EventType.TOOL_CALL_STARTED:
             raise WorkerCrash("worker died mid-tool before the side effect completed")
         return stored

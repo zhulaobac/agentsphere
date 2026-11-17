@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
+
+from agentsphere.kernel.events import Event
 
 _SECRET_KEY_FRAGMENTS = (
     "secret",
@@ -63,3 +66,19 @@ def _redact(value: Any, secrets: set[str]) -> Any:
                 redacted = redacted.replace(secret, REDACTED)
         return redacted
     return value
+
+
+class RedactingListener:
+    """Wrap an event listener so vault plaintext is stripped before traces/logs record it."""
+
+    def __init__(self, inner: object, secrets_fn: Callable[[], set[str]]) -> None:
+        self._inner = inner
+        self._secrets_fn = secrets_fn
+
+    async def on_event(self, event: Event) -> None:
+        payload = redact(event.payload, extra_secrets=self._secrets_fn())
+        redacted = event.model_copy(update={"payload": payload})
+        on_event = getattr(self._inner, "on_event", self._inner)
+        result = on_event(redacted)
+        if isinstance(result, Awaitable):
+            await result

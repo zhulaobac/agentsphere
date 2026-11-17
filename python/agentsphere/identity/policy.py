@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from agentsphere.identity.agent import AgentIdentity
 from agentsphere.kernel.actions import ToolCallRequest
+from agentsphere.kernel.events import Event, EventType
 from agentsphere.kernel.hitl import ApprovalRequired
 from agentsphere.kernel.invocation import current_invocation
 from agentsphere.kernel.middleware import MiddlewareStage, NextFn
@@ -169,6 +170,66 @@ class ApprovalStore:
 
     def pending_for_session(self, session_id: str) -> list[ApprovalRecord]:
         return [r for r in self._items.values() if r.session_id == session_id and r.status == "pending"]
+
+    def records_for_session(self, session_id: str) -> list[ApprovalRecord]:
+        return [r for r in self._items.values() if r.session_id == session_id]
+
+    def granted_keys(self, session_id: str) -> set[str]:
+        return {
+            r.idempotency_key
+            for r in self._items.values()
+            if r.session_id == session_id and r.status == "granted" and r.idempotency_key
+        }
+
+    def hydrate(self, events: list[Event]) -> None:
+        """Rebuild approval state from the event log (SQLite reopen / new worker)."""
+        for event in events:
+            payload = event.payload or {}
+            if event.type is EventType.APPROVAL_REQUESTED:
+                self.put(
+                    ApprovalRecord(
+                        approval_id=str(payload.get("approval_id") or event.event_id),
+                        session_id=event.session_id,
+                        turn_id=event.turn_id or "",
+                        tool_name=str(payload.get("name", "")),
+                        idempotency_key=str(payload.get("idempotency_key", "")),
+                        reason=str(payload.get("reason", "")),
+                        arguments=dict(payload.get("arguments") or {}),
+                        status="pending",
+                    )
+                )
+            elif event.type is EventType.APPROVAL_GRANTED:
+                approval_id = str(payload.get("approval_id") or "")
+                existing = self.get(approval_id) if approval_id else None
+                if existing is not None:
+                    self.decide(approval_id, "granted")
+                else:
+                    self.put(
+                        ApprovalRecord(
+                            approval_id=approval_id or event.event_id,
+                            session_id=event.session_id,
+                            turn_id=event.turn_id or "",
+                            tool_name=str(payload.get("tool_name", "")),
+                            idempotency_key=str(payload.get("idempotency_key", "")),
+                            status="granted",
+                        )
+                    )
+            elif event.type is EventType.APPROVAL_DENIED:
+                approval_id = str(payload.get("approval_id") or "")
+                existing = self.get(approval_id) if approval_id else None
+                if existing is not None:
+                    self.decide(approval_id, "denied")
+                else:
+                    self.put(
+                        ApprovalRecord(
+                            approval_id=approval_id or event.event_id,
+                            session_id=event.session_id,
+                            turn_id=event.turn_id or "",
+                            tool_name=str(payload.get("tool_name", "")),
+                            idempotency_key=str(payload.get("idempotency_key", "")),
+                            status="denied",
+                        )
+                    )
 
 
 class PolicyHitlMiddleware:

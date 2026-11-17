@@ -18,6 +18,7 @@ class InvocationContext:
     recovery: bool = False
     in_flight: bool = False
     confirm_commit: bool = False
+    confirm_keys: set[str] | None = None
 
 
 _current: ContextVar[InvocationContext | None] = ContextVar("agentsphere_invocation", default=None)

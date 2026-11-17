@@ -61,6 +61,7 @@ class AgentHarness:
         recovery: bool = False,
         in_flight_keys: set[str] | None = None,
         confirm_commit: bool = False,
+        confirm_keys: set[str] | None = None,
         agent_id: str = "",
     ) -> AsyncIterator[Event]:
         state = session_state.model_copy(deep=True)
@@ -223,6 +224,7 @@ class AgentHarness:
                             recovery=recovery,
                             in_flight_keys=in_flight_keys,
                             confirm_commit=confirm_commit,
+                            confirm_keys=confirm_keys,
                             agent_id=agent_id,
                         )
                     except ApprovalRequired as exc:

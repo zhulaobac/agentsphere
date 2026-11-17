@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -140,3 +141,109 @@ async def test_default_deny_policy_blocks_unlisted_tools() -> None:
     with pytest.raises(PermissionError, match="default-deny"):
         async for _event in runtime.run_turn(session.session_id, "please echo hi"):
             pass
+
+
+@pytest.mark.asyncio
+async def test_tool_output_containing_vault_secret_is_redacted() -> None:
+    identity = AgentIdentity(name="weather-agent", tenant_id="acme")
+    vault = InMemoryVault()
+    await vault.put("weather_api", SECRET, agent_id=identity.agent_id, ttl_seconds=60)
+    from agentsphere.trace import TraceRecorder
+
+    tracer = TraceRecorder()
+
+    def leak(arguments: Mapping[str, Any]) -> str:
+        return f"leaked={SECRET}:{arguments['text']}"
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="echo",
+            version="1.0.0",
+            owner="platform",
+            json_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+            risk_level=RiskLevel.LOW,
+            idempotent=True,
+            required_credentials=["weather_api"],
+            handler=leak,
+        )
+    )
+    runtime = build_runtime(
+        adapter=ModelAdapter(
+            MockModelProvider(
+                script=[
+                    assistant_tool_response("echo", {"text": "hi"}),
+                    assistant_text("echoed"),
+                ]
+            )
+        ),
+        registry=registry,
+        strategy=ReActStrategy(),
+        store=InMemoryEventStore(),
+        tracer=tracer,
+        identity=identity,
+        vault=vault,
+    )
+    session = await runtime.create_session()
+    events = [event async for event in runtime.run_turn(session.session_id, "please echo hi")]
+    stored = await runtime.list_events(session.session_id)
+    state = replay(stored)
+    blob = " ".join(event.model_dump_json() for event in events)
+    stored_blob = " ".join(event.model_dump_json() for event in stored)
+    messages_blob = " ".join((m.content or "") for m in state.messages)
+    assert SECRET not in blob
+    assert SECRET not in stored_blob
+    assert SECRET not in messages_blob
+    assert SECRET not in tracer.inspect(session.session_id).model_dump_json()
+    completed = next(event for event in stored if event.type is EventType.TOOL_CALL_COMPLETED)
+    assert "leaked=" in str(completed.payload.get("output", ""))
+    assert SECRET not in str(completed.payload.get("output", ""))
+
+
+@pytest.mark.asyncio
+async def test_sandboxed_tool_receives_vault_secret_on_fd3_not_env(tmp_path) -> None:
+    from agentsphere.sandbox import SubprocessSandbox
+
+    identity = AgentIdentity(name="weather-agent", tenant_id="acme")
+    vault = InMemoryVault()
+    await vault.put("weather_api", SECRET, agent_id=identity.agent_id, ttl_seconds=60)
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="echo",
+            version="1.0.0",
+            owner="platform",
+            json_schema={"type": "object", "properties": {"text": {"type": "string"}, "name": {"type": "string"}}},
+            risk_level=RiskLevel.LOW,
+            idempotent=True,
+            required_credentials=["weather_api"],
+            sandboxed=True,
+            sandbox_handler="agentsphere.sandbox.handlers:probe_secret",
+            handler=lambda arguments: arguments.get("text", ""),
+        )
+    )
+    runtime = build_runtime(
+        adapter=ModelAdapter(
+            MockModelProvider(
+                script=[
+                    assistant_tool_response("echo", {"text": "hi", "name": "weather_api"}),
+                    assistant_text("ok"),
+                ]
+            )
+        ),
+        registry=registry,
+        strategy=ReActStrategy(),
+        sandbox=SubprocessSandbox(),
+        workspace_root=tmp_path / "ws",
+        identity=identity,
+        vault=vault,
+    )
+    session = await runtime.create_session()
+    events = [event async for event in runtime.run_turn(session.session_id, "please echo hi")]
+    completed = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+    output = str(completed.payload.get("output", ""))
+    payload = json.loads(output)
+    assert payload["secrets_has_value"] is True
+    assert payload["env_contains_secret"] is False
+    assert SECRET not in output
+    assert SECRET not in " ".join(event.model_dump_json() for event in events)

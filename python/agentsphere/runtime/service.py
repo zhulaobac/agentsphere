@@ -10,7 +10,7 @@ from typing import Any
 from agentsphere.identity.agent import AgentIdentity
 from agentsphere.identity.audit import AuditLog, InMemoryAuditLog
 from agentsphere.identity.policy import ApprovalRecord, ApprovalStore, PolicyEngine, PolicyHitlMiddleware
-from agentsphere.identity.redact import contains_secret, redact
+from agentsphere.identity.redact import RedactingListener, contains_secret, redact
 from agentsphere.identity.vault import Vault
 from agentsphere.kernel.assembler import ContextAssembler
 from agentsphere.kernel.context import SessionState
@@ -71,8 +71,16 @@ class SessionRuntime:
         self.lease_ttl_seconds = lease_ttl_seconds
         self._secrets = set(secrets_for_redaction or ())
         self._controls: dict[str, TurnControl] = {}
+        if vault is not None:
+            add_sink = getattr(vault, "add_sink", None)
+            if callable(add_sink):
+                add_sink(self.add_secret_for_redaction)
+            known = getattr(vault, "known_plaintext_secrets", None)
+            if callable(known):
+                for secret in known():
+                    self.add_secret_for_redaction(secret)
         if tracer is not None:
-            self.harness.event_emitter.add_listener(tracer)
+            self.harness.event_emitter.add_listener(RedactingListener(tracer, self._secret_set))
 
     def add_secret_for_redaction(self, secret: str) -> None:
         if secret:
@@ -80,6 +88,14 @@ class SessionRuntime:
             add = getattr(self.audit, "add_secret", None)
             if callable(add):
                 add(secret)
+
+    def _secret_set(self) -> set[str]:
+        secrets = set(self._secrets)
+        if self.vault is not None:
+            known = getattr(self.vault, "known_plaintext_secrets", None)
+            if callable(known):
+                secrets |= set(known() or ())
+        return secrets
 
     async def create_session(
         self,
@@ -135,7 +151,8 @@ class SessionRuntime:
                 type=EventType.LEASE_ACQUIRED,
                 session_id=session_id,
                 payload={"worker_id": worker_id, "token": lease.token, "lease_id": lease.lease_id},
-            )
+            ),
+            lease=lease,
         )
         return lease
 
@@ -143,14 +160,16 @@ class SessionRuntime:
         return await self.store.heartbeat_lease(session_id, worker_id, token, self.lease_ttl_seconds)
 
     async def release_lease(self, session_id: str, worker_id: str, token: int) -> None:
-        await self.store.release_lease(session_id, worker_id, token)
         await self._persist(
             Event(
                 type=EventType.LEASE_RELEASED,
                 session_id=session_id,
                 payload={"worker_id": worker_id, "token": token},
-            )
+            ),
+            worker_id=worker_id,
+            token=token,
         )
+        await self.store.release_lease(session_id, worker_id, token)
 
     async def get_lease(self, session_id: str) -> WorkerLease | None:
         return await self.store.get_lease(session_id)
@@ -178,25 +197,37 @@ class SessionRuntime:
         return session
 
     async def approve(self, session_id: str, approval_id: str) -> ApprovalRecord:
+        events = await self.store.list_events(session_id)
+        self.approvals.hydrate(events)
         record = self.approvals.decide(approval_id, "granted")
         await self._persist(
             Event(
                 type=EventType.APPROVAL_GRANTED,
                 session_id=session_id,
                 turn_id=record.turn_id,
-                payload={"approval_id": approval_id, "tool_name": record.tool_name},
+                payload={
+                    "approval_id": approval_id,
+                    "tool_name": record.tool_name,
+                    "idempotency_key": record.idempotency_key,
+                },
             )
         )
         return record
 
     async def deny(self, session_id: str, approval_id: str) -> ApprovalRecord:
+        events = await self.store.list_events(session_id)
+        self.approvals.hydrate(events)
         record = self.approvals.decide(approval_id, "denied")
         await self._persist(
             Event(
                 type=EventType.APPROVAL_DENIED,
                 session_id=session_id,
                 turn_id=record.turn_id,
-                payload={"approval_id": approval_id, "tool_name": record.tool_name},
+                payload={
+                    "approval_id": approval_id,
+                    "tool_name": record.tool_name,
+                    "idempotency_key": record.idempotency_key,
+                },
             )
         )
         return record
@@ -246,9 +277,11 @@ class SessionRuntime:
                 state.tool_pins = session.tool_pins
 
             events = await self.store.list_events(session_id)
+            self.approvals.hydrate(events)
             open_turn = in_progress_turn(events)
             resume_spec = None
             in_flight = set()
+            confirm_keys: set[str] = set()
             confirm_commit = False
             if resume or open_turn is not None:
                 if open_turn is None:
@@ -259,16 +292,15 @@ class SessionRuntime:
                 resume_spec.user_input = user_input
                 resume_spec.turn_index = turn_index
                 in_flight = in_flight_tool_keys(events, turn_id=turn_id)
-                pending = self.approvals.pending_for_session(session_id)
-                granted = [
-                    r
-                    for r in self.approvals._items.values()
-                    if r.session_id == session_id and r.status == "granted"
-                ]
-                confirm_commit = bool(granted)
+                confirm_keys = self.approvals.granted_keys(session_id)
+                # Per-key only: a grant for one idempotency_key must not confirm other tools.
+                confirm_commit = False
                 session.status = SessionStatus.ACTIVE
                 await self.store.update_session(session)
-                await self._persist(Event(type=EventType.SESSION_RESUMED, session_id=session_id, payload={"worker_id": worker}))
+                await self._persist(
+                    Event(type=EventType.SESSION_RESUMED, session_id=session_id, payload={"worker_id": worker}),
+                    lease=lease,
+                )
             elif session.status is SessionStatus.PAUSED:
                 session.status = SessionStatus.ACTIVE
                 await self.store.update_session(session)
@@ -288,6 +320,7 @@ class SessionRuntime:
                 recovery=recovery,
                 in_flight_keys=in_flight,
                 confirm_commit=confirm_commit,
+                confirm_keys=confirm_keys,
                 agent_id=session.agent_id or self.identity.agent_id,
             ):
                 try:
@@ -313,19 +346,22 @@ class SessionRuntime:
                         turn.status = TurnStatus.WAITING_APPROVAL
                         await self.store.upsert_turn(turn)
                     await self.store.update_session(session)
-                    await self._checkpoint(session_id, stored, state_hint=None, reason="approval_requested")
+                    await self._checkpoint(session_id, stored, state_hint=None, reason="approval_requested", lease=lease)
                 elif stored.type is EventType.TURN_PAUSED:
                     session.status = SessionStatus.PAUSED
                     if turn is not None:
                         turn.status = TurnStatus.PAUSED
                         await self.store.upsert_turn(turn)
                     await self.store.update_session(session)
-                    await self._checkpoint(session_id, stored, reason="paused")
-                    await self._persist(Event(type=EventType.SESSION_PAUSED, session_id=session_id, payload={}))
+                    await self._checkpoint(session_id, stored, reason="paused", lease=lease)
+                    await self._persist(
+                        Event(type=EventType.SESSION_PAUSED, session_id=session_id, payload={}),
+                        lease=lease,
+                    )
                 elif stored.type is EventType.STEP_COMPLETED:
-                    await self._checkpoint(session_id, stored, reason="step")
+                    await self._checkpoint(session_id, stored, reason="step", lease=lease)
                 elif stored.type is EventType.TURN_COMPLETED:
-                    await self._checkpoint(session_id, stored, reason="turn_completed")
+                    await self._checkpoint(session_id, stored, reason="turn_completed", lease=lease)
                 yield stored
         except BaseException as exc:
             crash = exc
@@ -392,6 +428,7 @@ class SessionRuntime:
         *,
         reason: str,
         state_hint: SessionState | None = None,
+        lease: WorkerLease | None = None,
     ) -> Checkpoint:
         events = await self.store.list_events(session_id)
         state = state_hint or recover_state(
@@ -424,25 +461,29 @@ class SessionRuntime:
                     "reason": reason,
                     "workspace_snapshot_ref": workspace_ref,
                 },
-            )
+            ),
+            lease=lease,
         )
         return stored
 
-    async def _persist(self, event: Event, lease: WorkerLease | None = None) -> Event:
-        if lease is not None:
-            current = await self.store.get_lease(event.session_id)
-            if (
-                current is None
-                or current.worker_id != lease.worker_id
-                or current.token != lease.token
-                or current.released
-            ):
-                raise StaleLeaseError(event.session_id, lease.worker_id, lease.token)
-        payload = redact(event.payload, extra_secrets=self._secrets)
-        if self._secrets and contains_secret(payload, self._secrets):
-            payload = redact(payload, extra_secrets=self._secrets)
+    async def _persist(
+        self,
+        event: Event,
+        lease: WorkerLease | None = None,
+        *,
+        worker_id: str | None = None,
+        token: int | None = None,
+    ) -> Event:
+        secrets = self._secret_set()
+        payload = redact(event.payload, extra_secrets=secrets)
+        if secrets and contains_secret(payload, secrets):
+            payload = redact(payload, extra_secrets=secrets)
         event = event.model_copy(update={"payload": payload})
-        return await self.store.append_event(event)
+        return await self.store.append_event(
+            event,
+            worker_id=worker_id or (lease.worker_id if lease is not None else None),
+            token=token if token is not None else (lease.token if lease is not None else None),
+        )
 
     async def _require_session(self, session_id: str) -> Session:
         session = await self.store.get_session(session_id)

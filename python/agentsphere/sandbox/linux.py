@@ -162,11 +162,20 @@ def apply_landlock(writable: Iterable[Path], readable: Iterable[Path]) -> bool:
 
 
 def _add_path(libc: ctypes.CDLL, ruleset_fd: int, path: Path, access: int, seen: set[str]) -> None:
-    resolved = str(Path(path).resolve())
+    try:
+        candidate = Path(path)
+        if not candidate.exists():
+            return
+        resolved = str(candidate.resolve())
+    except OSError:
+        return
     if resolved in seen:
         return
     seen.add(resolved)
-    fd = os.open(resolved, os.O_PATH | os.O_CLOEXEC)
+    try:
+        fd = os.open(resolved, os.O_PATH | os.O_CLOEXEC)
+    except OSError:
+        return
     try:
         rule = _PathBeneath(access, fd)
         libc.syscall(
