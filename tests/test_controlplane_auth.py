@@ -199,6 +199,8 @@ async def test_foreign_principal_cannot_use_experiment_run(
         cp.get_experiment("exp-shared")
     with pytest.raises(AuthorizationError):
         cp.get_experiment("exp-shared", other_tenant)
+    with pytest.raises(AuthorizationError):
+        cp.get_experiment("exp-shared", other_tenant, tenant=principal.tenant)
     alice_run = cp.get_experiment("exp-shared", principal)
     assert alice_run is not None
     assert alice_run.spec.tenant == principal.tenant
@@ -216,6 +218,32 @@ async def test_foreign_principal_cannot_use_experiment_run(
         cp.register_experiment(rewritten)
     with pytest.raises((AuthorizationError, LifecycleError)):
         await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen2")
+
+    fp_data = alice_run.model_dump()
+    fp_data["run_id"] = "exp-stolen-fp"
+    fp_data["spec"]["tenant"] = other_tenant.tenant
+    fp_data["summary"]["fingerprint"] = "stub-x"
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(ExperimentRun.model_validate(fp_data), other_tenant)
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-fp")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_gate("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-fp")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.release("bot", "0.1.0", other_tenant)
+
+    agent_data = alice_run.model_dump()
+    agent_data["run_id"] = "exp-stolen-agent"
+    agent_data["spec"]["tenant"] = other_tenant.tenant
+    agent_data["agent_fingerprint"] = "changed"
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(ExperimentRun.model_validate(agent_data), other_tenant)
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-agent")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_gate("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-agent")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.release("bot", "0.1.0", other_tenant)
 
     cp.register_experiment(
         stub_experiment_run(

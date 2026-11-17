@@ -73,12 +73,41 @@ def _snapshot_experiment_run(run: Any) -> Any:
 
 
 def _experiment_evidence_key(run: Any) -> str:
-    payload = run.model_dump(mode="json")
-    payload.pop("run_id", None)
-    payload.pop("created_at", None)
-    spec = dict(payload.get("spec") or {})
-    spec.pop("tenant", None)
-    payload["spec"] = spec
+    spec = getattr(run, "spec", None)
+    summary = getattr(run, "summary", None)
+    cases: list[dict[str, Any]] = []
+    for case_run in getattr(run, "cases", None) or []:
+        case = getattr(case_run, "case", None)
+        samples: list[dict[str, Any]] = []
+        for sample in getattr(case_run, "samples", None) or []:
+            result = getattr(sample, "result", None)
+            samples.append(
+                {
+                    "output": getattr(sample, "output", ""),
+                    "passed": getattr(sample, "passed", False),
+                    "score": getattr(result, "score", None) if result is not None else None,
+                    "result_passed": getattr(result, "passed", None) if result is not None else None,
+                }
+            )
+        cases.append(
+            {
+                "input": getattr(case, "input", None) if case is not None else None,
+                "expected": getattr(case, "expected", None) if case is not None else None,
+                "labels": getattr(case, "labels", None) if case is not None else None,
+                "samples": samples,
+            }
+        )
+    payload = {
+        "agent_name": getattr(spec, "agent_name", None),
+        "agent_version": getattr(spec, "agent_version", None),
+        "dataset_name": getattr(spec, "dataset_name", None),
+        "dataset_version": getattr(spec, "dataset_version", None),
+        "evaluator_name": getattr(spec, "evaluator_name", None),
+        "evaluator_version": getattr(spec, "evaluator_version", None),
+        "pass_rate": getattr(summary, "pass_rate", None),
+        "pass_at_k": getattr(summary, "pass_at_k", None),
+        "cases": cases,
+    }
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -147,6 +176,8 @@ class ControlPlane:
         tenant_id = tenant if tenant is not None else (principal.tenant if principal is not None else None)
         if not tenant_id:
             raise AuthorizationError("get_experiment requires a Principal or tenant")
+        if principal is not None:
+            assert_same_tenant(principal, tenant_id, action="read", resource=f"experiment:{run_id}")
         item = self._experiments.get(run_id)
         if item is None:
             return None
