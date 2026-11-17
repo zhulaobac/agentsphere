@@ -16,6 +16,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import Span, Status, StatusCode, set_span_in_context
 from pydantic import BaseModel, Field
 
+from agentsphere.identity.redact import is_secret_key
 from agentsphere.kernel.events import Event, EventType
 
 
@@ -93,7 +94,7 @@ class TraceRecorder:
                     "turn_id": event.turn_id,
                     "step_id": event.step_id,
                     "event_type": event.type.value,
-                    **{k: v for k, v in event.payload.items() if _is_attr(v)},
+                    **{k: v for k, v in event.payload.items() if _is_attr(v) and not is_secret_key(str(k))},
                 },
             )
             self._nodes[session_id][node_key] = node
@@ -116,7 +117,9 @@ class TraceRecorder:
                 span.end()
             if node is not None:
                 node.end_time = event.timestamp
-                node.attributes.update({k: v for k, v in event.payload.items() if _is_attr(v)})
+                node.attributes.update(
+                    {k: v for k, v in event.payload.items() if _is_attr(v) and not is_secret_key(str(k))}
+                )
             stack = self._stack[session_id]
             if stack and stack[-1] == node_key:
                 stack.pop()

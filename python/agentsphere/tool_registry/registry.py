@@ -25,6 +25,12 @@ class BoundTool:
         self.version = spec.version
         self.parameter_schema = spec.json_schema
         self.idempotent = spec.idempotent
+        self.compensation_action = spec.compensation_action
+        self.two_phase = spec.two_phase
+        self.sandboxed = spec.sandboxed
+        self.sandbox_handler = spec.sandbox_handler
+        self.required_credentials = list(spec.required_credentials)
+        self.risk_level = spec.risk_level
         self.spec = spec
 
     def invoke(self, arguments: Mapping[str, Any]) -> Any:

@@ -35,6 +35,7 @@ class Message(BaseModel):
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     name: str | None = None
+    untrusted: bool = False
 
 
 class InferenceParams(BaseModel):

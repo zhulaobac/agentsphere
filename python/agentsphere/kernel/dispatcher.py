@@ -1,4 +1,4 @@
-"""Tool Dispatcher: schema validation, concurrency, timeout/retry, result truncation."""
+"""Tool Dispatcher: schema validation, concurrency, timeout/retry, result truncation, idempotency cache."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
@@ -14,6 +16,8 @@ from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from pydantic import BaseModel, Field
 
 from agentsphere.kernel.actions import ToolCallRequest
+from agentsphere.kernel.hitl import ApprovalRequired
+from agentsphere.kernel.invocation import InvocationContext, bind_invocation, reset_invocation
 from agentsphere.kernel.middleware import Middleware, MiddlewareStage, run_chain
 
 
@@ -21,6 +25,10 @@ class ToolInvokeError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class NonIdempotentRecoveryError(RuntimeError):
+    """A non-idempotent in-flight tool must not be silently re-executed on recovery."""
 
 
 class ExecutableTool(Protocol):
@@ -36,6 +44,12 @@ class ToolResolver(Protocol):
     def resolve(self, name: str, version: str | None = None) -> ExecutableTool: ...
 
 
+class ResultCacheLookup(Protocol):
+    async def get_result(self, idempotency_key: str) -> Any: ...
+
+    async def put_result(self, record: Any) -> None: ...
+
+
 class ToolResult(BaseModel):
     call_id: str
     name: str
@@ -45,6 +59,10 @@ class ToolResult(BaseModel):
     error: str | None = None
     attempts: int = 1
     idempotency_key: str = ""
+    from_cache: bool = False
+    skipped_non_idempotent: bool = False
+    phase: str = "execute"
+    untrusted: bool = True
 
 
 class DispatcherConfig(BaseModel):
@@ -61,10 +79,25 @@ class ToolDispatcher:
         resolver: ToolResolver,
         config: DispatcherConfig | None = None,
         middlewares: Sequence[Middleware] | None = None,
+        *,
+        result_cache: ResultCacheLookup | None = None,
+        vault: Any = None,
+        sandbox: Any = None,
+        identity: Any = None,
+        audit: Any = None,
+        approvals: Any = None,
+        workspace_path: str | None = None,
     ) -> None:
         self.resolver = resolver
         self.config = config or DispatcherConfig()
         self.middlewares = list(middlewares or [])
+        self.result_cache = result_cache
+        self.vault = vault
+        self.sandbox = sandbox
+        self.identity = identity
+        self.audit = audit
+        self.approvals = approvals
+        self.workspace_path = workspace_path
 
     async def dispatch(
         self,
@@ -73,14 +106,46 @@ class ToolDispatcher:
         session_id: str,
         turn_id: str,
         step_id: str,
+        step_index: int = 0,
+        recovery: bool = False,
+        in_flight_keys: set[str] | None = None,
+        confirm_commit: bool = False,
+        agent_id: str = "",
     ) -> list[ToolResult]:
         semaphore = asyncio.Semaphore(self.config.max_concurrency)
+        in_flight = set(in_flight_keys or ())
 
         async def one(call: ToolCallRequest, index: int) -> ToolResult:
             async with semaphore:
-                return await self._invoke(call, session_id, turn_id, step_id, index)
+                return await self._invoke(
+                    call,
+                    session_id,
+                    turn_id,
+                    step_id,
+                    index,
+                    step_index=step_index,
+                    recovery=recovery,
+                    in_flight=in_flight,
+                    confirm_commit=confirm_commit,
+                    agent_id=agent_id,
+                )
 
-        return list(await asyncio.gather(*[one(call, i) for i, call in enumerate(calls)]))
+        gathered = await asyncio.gather(
+            *[one(call, i) for i, call in enumerate(calls)],
+            return_exceptions=True,
+        )
+        results: list[ToolResult] = []
+        approval: ApprovalRequired | None = None
+        for item in gathered:
+            if isinstance(item, ApprovalRequired):
+                approval = item
+            elif isinstance(item, BaseException):
+                raise item
+            else:
+                results.append(item)
+        if approval is not None:
+            raise approval
+        return results
 
     async def _invoke(
         self,
@@ -89,17 +154,60 @@ class ToolDispatcher:
         turn_id: str,
         step_id: str,
         index: int,
+        *,
+        step_index: int,
+        recovery: bool,
+        in_flight: set[str],
+        confirm_commit: bool,
+        agent_id: str,
     ) -> ToolResult:
-        key = _idempotency_key(session_id, turn_id, step_id, index, call)
+        key = idempotency_key(session_id, turn_id, step_index, index, call)
+        invocation = InvocationContext(
+            session_id=session_id,
+            turn_id=turn_id,
+            step_id=step_id,
+            step_index=step_index,
+            call_index=index,
+            agent_id=agent_id,
+            idempotency_key=key,
+            recovery=recovery,
+            in_flight=key in in_flight,
+            confirm_commit=confirm_commit,
+        )
+        token = bind_invocation(invocation)
+        try:
+            return await self._invoke_bound(call, key, invocation)
+        finally:
+            reset_invocation(token)
+
+    async def _invoke_bound(
+        self,
+        call: ToolCallRequest,
+        key: str,
+        invocation: InvocationContext,
+    ) -> ToolResult:
+        cached = await self._cache_lookup(key)
+        if cached is not None:
+            prepare_waiting_commit = cached.phase == "prepare" and invocation.confirm_commit
+            if not prepare_waiting_commit:
+                return cached.model_copy(update={"from_cache": True})
+
         try:
             tool = self.resolver.resolve(call.name, call.version)
         except Exception as exc:  # noqa: BLE001
-            return ToolResult(
+            return ToolResult(call_id=call.id, name=call.name, error=str(exc), idempotency_key=key)
+
+        if invocation.recovery and invocation.in_flight and not _is_idempotent(tool):
+            result = ToolResult(
                 call_id=call.id,
                 name=call.name,
-                error=str(exc),
+                version=getattr(tool, "version", ""),
+                error="non-idempotent tool was in-flight; recovery will not re-execute it",
                 idempotency_key=key,
+                skipped_non_idempotent=True,
             )
+            await self._cache_store(invocation, result, phase="skipped")
+            return result
 
         try:
             _validate_params(call.arguments, tool.parameter_schema)
@@ -107,55 +215,77 @@ class ToolDispatcher:
             return ToolResult(
                 call_id=call.id,
                 name=call.name,
-                version=tool.version,
+                version=getattr(tool, "version", ""),
                 error=f"parameter validation failed: {exc.message}",
                 idempotency_key=key,
             )
+
+        if self.approvals is not None:
+            await self._enforce_approval(call, invocation)
+
+        two_phase = bool(getattr(tool, "two_phase", False))
+        phase = "commit" if (two_phase and invocation.confirm_commit) else ("prepare" if two_phase else "execute")
 
         attempts = 0
         last_error: str | None = None
         max_tries = 1 + max(0, self.config.max_retries)
         raw: Any = None
         succeeded = False
+        issued = None
+        issued_token = None
+        if self.vault is not None:
+            issued, issued_token = await self._issue_credentials(tool, invocation)
 
-        while attempts < max_tries:
-            attempts += 1
+        try:
+            while attempts < max_tries:
+                attempts += 1
 
-            async def core(payload: ToolCallRequest) -> Any:
-                return await _call_handler(tool.invoke, payload.arguments)
+                async def core(payload: ToolCallRequest) -> Any:
+                    return await self._call_tool(tool, payload, invocation, phase=phase)
 
-            try:
-                raw = await asyncio.wait_for(
-                    run_chain(
-                        self.middlewares,
-                        MiddlewareStage.BEFORE_TOOL,
-                        call,
-                        core,
-                    ),
-                    timeout=self.config.timeout_seconds,
-                )
-                succeeded = True
-                break
-            except TimeoutError:
-                last_error = f"tool timed out after {self.config.timeout_seconds}s"
-            except Exception as exc:  # noqa: BLE001
-                last_error = str(exc)
-                if isinstance(exc, ToolInvokeError) and not exc.retryable:
+                try:
+                    raw = await asyncio.wait_for(
+                        run_chain(
+                            self.middlewares,
+                            MiddlewareStage.BEFORE_TOOL,
+                            call,
+                            core,
+                        ),
+                        timeout=self.config.timeout_seconds,
+                    )
+                    succeeded = True
                     break
-            if attempts < max_tries:
-                await asyncio.sleep(self.config.retry_backoff_seconds * attempts)
+                except ApprovalRequired:
+                    raise
+                except PermissionError:
+                    raise
+                except TimeoutError:
+                    last_error = f"tool timed out after {self.config.timeout_seconds}s"
+                except Exception as exc:  # noqa: BLE001
+                    last_error = str(exc)
+                    if isinstance(exc, ToolInvokeError) and not exc.retryable:
+                        break
+                if attempts < max_tries:
+                    await asyncio.sleep(self.config.retry_backoff_seconds * attempts)
+        finally:
+            if issued_token is not None:
+                from agentsphere.identity.vault import reset_issued_credential
+
+                reset_issued_credential(issued_token)
+            del issued
 
         if not succeeded:
-            return ToolResult(
+            result = ToolResult(
                 call_id=call.id,
                 name=call.name,
-                version=tool.version,
+                version=getattr(tool, "version", ""),
                 error=last_error or "tool failed",
                 attempts=attempts,
                 idempotency_key=key,
+                phase=phase,
             )
+            return result
 
-        # after_tool runs only after a successful invoke and must not re-enter the retry loop.
         try:
             after = await run_chain(
                 self.middlewares,
@@ -163,25 +293,198 @@ class ToolDispatcher:
                 raw,
                 _identity,
             )
+        except ApprovalRequired:
+            raise
         except Exception as exc:  # noqa: BLE001
             return ToolResult(
                 call_id=call.id,
                 name=call.name,
-                version=tool.version,
+                version=getattr(tool, "version", ""),
                 error=f"after_tool middleware failed: {exc}",
                 attempts=attempts,
                 idempotency_key=key,
+                phase=phase,
             )
 
         text, truncated = _truncate(_stringify(after), self.config.max_result_chars)
-        return ToolResult(
+        result = ToolResult(
             call_id=call.id,
             name=call.name,
-            version=tool.version,
+            version=getattr(tool, "version", ""),
             output=text,
             truncated=truncated,
             attempts=attempts,
             idempotency_key=key,
+            phase=phase,
+            untrusted=True,
+        )
+        await self._cache_store(invocation, result, phase=phase)
+        await self._audit_tool(invocation, call, result)
+        if two_phase and phase == "prepare" and not invocation.confirm_commit:
+            raise ApprovalRequired(
+                call,
+                reason="two-phase tool requires confirmation before commit",
+                session_id=invocation.session_id,
+                turn_id=invocation.turn_id,
+                idempotency_key=key,
+            )
+        return result
+
+    async def _call_tool(
+        self,
+        tool: ExecutableTool,
+        call: ToolCallRequest,
+        invocation: InvocationContext,
+        *,
+        phase: str,
+    ) -> Any:
+        if getattr(tool, "sandboxed", False) and self.sandbox is not None:
+            return await self._sandbox_invoke(tool, call, invocation)
+        handler = tool.invoke
+        spec = getattr(tool, "spec", None)
+        if phase == "prepare" and spec is not None and spec.prepare_handler is not None:
+            handler = spec.prepare_handler
+        elif phase == "commit" and spec is not None and spec.commit_handler is not None:
+            handler = spec.commit_handler
+        return await _call_handler(handler, call.arguments)
+
+    async def _sandbox_invoke(
+        self,
+        tool: ExecutableTool,
+        call: ToolCallRequest,
+        invocation: InvocationContext,
+    ) -> Any:
+        from agentsphere.sandbox.limits import SandboxSpec
+        from agentsphere.sandbox.worker import SECRET_FD
+
+        spec = getattr(tool, "spec", None)
+        handler = getattr(tool, "sandbox_handler", None) or (spec.sandbox_handler if spec is not None else None)
+        if not handler:
+            raise ToolInvokeError("sandboxed tool is missing sandbox_handler (module:function)")
+        job = json.dumps({"handler": handler, "arguments": call.arguments, "phase": "execute"})
+        secrets: dict[str, str] = {}
+        if self.vault is not None:
+            from agentsphere.identity.vault import current_issued_credential
+
+            issued = current_issued_credential()
+            if issued is not None:
+                secrets[issued.secret_name] = await self.vault.reveal(issued.token)
+        secret_r, secret_w = os.pipe()
+        os.write(secret_w, json.dumps(secrets).encode("utf-8"))
+        os.close(secret_w)
+        secrets.clear()
+        try:
+            sandbox_spec = SandboxSpec(working_directory=self.workspace_path)
+            result = await self.sandbox.run(
+                [sys.executable, "-m", "agentsphere.sandbox.worker"],
+                sandbox_spec,
+                stdin_data=job.encode("utf-8"),
+                extra_fds={SECRET_FD: secret_r},
+            )
+        finally:
+            try:
+                os.close(secret_r)
+            except OSError:
+                pass
+        if result.timed_out:
+            raise ToolInvokeError(f"sandbox timed out after {sandbox_spec.limits.wall_time_seconds}s")
+        payload = json.loads(result.stdout or "{}") if result.stdout else {}
+        if not payload.get("ok", False):
+            raise ToolInvokeError(str(payload.get("error") or result.stderr or "sandbox tool failed"))
+        return payload.get("result")
+
+    async def _issue_credentials(self, tool: ExecutableTool, invocation: InvocationContext):
+        from agentsphere.identity.vault import bind_issued_credential
+
+        names = list(getattr(tool, "required_credentials", []) or [])
+        if not names:
+            return None, None
+        agent_id = invocation.agent_id or getattr(self.identity, "agent_id", "")
+        issued = await self.vault.issue(names[0], agent_id=agent_id)
+        return issued, bind_issued_credential(issued)
+
+    async def _enforce_approval(self, call: ToolCallRequest, invocation: InvocationContext) -> None:
+        record = self.approvals.decision_for(
+            session_id=invocation.session_id,
+            idempotency_key=invocation.idempotency_key,
+        )
+        if record is None:
+            return
+        if record.status == "granted":
+            invocation.confirm_commit = True
+            return
+        if record.status == "denied":
+            raise PermissionError(f"human denied tool {call.name}")
+        if record.status == "pending":
+            raise ApprovalRequired(
+                call,
+                reason="waiting for human approval",
+                approval_id=record.approval_id,
+                session_id=invocation.session_id,
+                turn_id=invocation.turn_id,
+                idempotency_key=invocation.idempotency_key,
+            )
+
+    async def _cache_lookup(self, key: str) -> ToolResult | None:
+        if self.result_cache is None:
+            return None
+        record = await self.result_cache.get_result(key)
+        if record is None:
+            return None
+        payload = record.payload if hasattr(record, "payload") else record
+        if hasattr(payload, "model_dump"):
+            payload = payload.model_dump()
+        result = ToolResult.model_validate(payload)
+        result.from_cache = True
+        if hasattr(record, "phase"):
+            result.phase = record.phase
+        return result
+
+    async def _cache_store(self, invocation: InvocationContext, result: ToolResult, *, phase: str) -> None:
+        if self.result_cache is None:
+            return
+        from agentsphere.runtime.cache import CachedResult
+
+        await self.result_cache.put_result(
+            CachedResult(
+                idempotency_key=result.idempotency_key,
+                session_id=invocation.session_id,
+                turn_id=invocation.turn_id,
+                step_index=invocation.step_index,
+                name=result.name,
+                payload=result.model_dump(),
+                phase=phase,
+            )
+        )
+
+    async def _audit_tool(
+        self,
+        invocation: InvocationContext,
+        call: ToolCallRequest,
+        result: ToolResult,
+    ) -> None:
+        if self.audit is None:
+            return
+        from agentsphere.identity.audit import AuditRecord
+        from agentsphere.identity.redact import redact
+
+        await self.audit.record(
+            AuditRecord(
+                agent_id=invocation.agent_id,
+                action="tool.call",
+                resource=call.name,
+                decision="error" if result.error else "ok",
+                session_id=invocation.session_id,
+                turn_id=invocation.turn_id,
+                details=redact(
+                    {
+                        "call_id": call.id,
+                        "arguments": call.arguments,
+                        "from_cache": result.from_cache,
+                        "phase": result.phase,
+                    }
+                ),
+            )
         )
 
 
@@ -226,18 +529,23 @@ def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
     return text[:keep] + marker, True
 
 
-def _idempotency_key(
+def _is_idempotent(tool: ExecutableTool) -> bool:
+    return bool(getattr(tool, "idempotent", False))
+
+
+def idempotency_key(
     session_id: str,
     turn_id: str,
-    step_id: str,
+    step_index: int,
     index: int,
     call: ToolCallRequest,
 ) -> str:
+    """Stable key: hash(session, turn, step). Recovery must reuse this, so step_index is used, not a random step_id."""
     material = json.dumps(
         {
             "session": session_id,
             "turn": turn_id,
-            "step": step_id,
+            "step": step_index,
             "index": index,
             "name": call.name,
             "arguments": call.arguments,
@@ -246,3 +554,7 @@ def _idempotency_key(
         default=str,
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+# P0 name kept as a private alias so existing imports of the helper still work if any.
+_idempotency_key = idempotency_key

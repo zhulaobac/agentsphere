@@ -1,5 +1,6 @@
-"""AgentSphere P0 skeleton: Harness Kernel, Model Adapter, Runtime, Tool Registry, Trace."""
+"""AgentSphere: Harness Kernel, Managed Runtime, Sandbox, Identity/Vault."""
 
+from agentsphere.identity import AgentIdentity, InMemoryAuditLog, InMemoryVault, StaticPolicyEngine
 from agentsphere.kernel import (
     AgentHarness,
     CallModel,
@@ -14,27 +15,35 @@ from agentsphere.kernel import (
     WorkflowStrategy,
 )
 from agentsphere.model_adapter import MockModelProvider, ModelAdapter
-from agentsphere.runtime import SessionRuntime, build_runtime
+from agentsphere.runtime import SessionRuntime, WorkerLease, build_runtime
+from agentsphere.sandbox import SandboxSpec, SubprocessSandbox
 from agentsphere.tool_registry import ToolRegistry, ToolSpec
 from agentsphere.trace import TraceRecorder
 
 __all__ = [
     "AgentHarness",
+    "AgentIdentity",
     "CallModel",
     "CallTool",
     "Event",
     "EventType",
     "Finish",
     "Handoff",
+    "InMemoryAuditLog",
+    "InMemoryVault",
     "LoopStrategy",
     "MockModelProvider",
     "ModelAdapter",
     "ReActStrategy",
+    "SandboxSpec",
     "SessionRuntime",
     "SessionState",
+    "StaticPolicyEngine",
+    "SubprocessSandbox",
     "ToolRegistry",
     "ToolSpec",
     "TraceRecorder",
+    "WorkerLease",
     "WorkflowStrategy",
     "build_runtime",
 ]

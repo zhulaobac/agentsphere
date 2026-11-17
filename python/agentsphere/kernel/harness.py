@@ -12,8 +12,9 @@ from collections.abc import AsyncIterator, Sequence
 from agentsphere.kernel.actions import CallModel, CallTool, Finish, Handoff, ToolCallRequest
 from agentsphere.kernel.assembler import ContextAssembler
 from agentsphere.kernel.context import SessionState, TurnContext
-from agentsphere.kernel.dispatcher import ToolDispatcher, ToolResult
+from agentsphere.kernel.dispatcher import ToolDispatcher, ToolResult, idempotency_key
 from agentsphere.kernel.events import Event, EventEmitter, EventType
+from agentsphere.kernel.hitl import ApprovalRequired
 from agentsphere.kernel.ids import new_id
 from agentsphere.kernel.loop.strategy import LoopStrategy
 from agentsphere.kernel.middleware import Middleware, MiddlewareStage, run_chain
@@ -25,6 +26,7 @@ from agentsphere.model_adapter.types import (
     ModelResponse,
     ToolDefinition,
 )
+from agentsphere.kernel.control import TurnCancelled, TurnControl, TurnPaused, TurnResume
 
 
 class AgentHarness:
@@ -49,36 +51,64 @@ class AgentHarness:
         self.max_steps = max_steps
         self.tool_definitions = list(tool_definitions or [])
 
-    async def run_turn(self, session_state: SessionState, user_input: str) -> AsyncIterator[Event]:
+    async def run_turn(
+        self,
+        session_state: SessionState,
+        user_input: str,
+        *,
+        resume: TurnResume | None = None,
+        control: TurnControl | None = None,
+        recovery: bool = False,
+        in_flight_keys: set[str] | None = None,
+        confirm_commit: bool = False,
+        agent_id: str = "",
+    ) -> AsyncIterator[Event]:
         state = session_state.model_copy(deep=True)
-        turn_id = new_id("turn")
-        turn_index = state.turn_index + 1
-        state.turn_index = turn_index
-        state.messages.append(Message(role=MessageRole.USER, content=user_input))
-        # P0 has no wait-for-user / resume node: every turn restarts the workflow DAG.
-        state.workflow_cursor = None
-        state.workflow_node_outputs = {}
+        resuming = resume is not None
+        turn_id = resume.turn_id if resume is not None else new_id("turn")
+        if resume is not None:
+            turn_index = resume.turn_index or state.turn_index
+            state.turn_index = turn_index
+            user_input = resume.user_input or user_input
+        else:
+            turn_index = state.turn_index + 1
+            state.turn_index = turn_index
+            state.messages.append(Message(role=MessageRole.USER, content=user_input))
+            # New turns restart the workflow DAG. Resume keeps cursor/outputs.
+            state.workflow_cursor = None
+            state.workflow_node_outputs = {}
 
         async def emit(**kwargs: object) -> Event:
             event = self.event_emitter.make(**kwargs)  # type: ignore[arg-type]
             await self.event_emitter.emit(event)
             return event
 
-        yield await emit(
-            type=EventType.TURN_STARTED,
-            session_id=state.session_id,
-            turn_id=turn_id,
-            payload={"user_input": user_input, "turn_index": turn_index, "strategy": getattr(self.strategy, "name", "")},
-        )
+        if resuming:
+            yield await emit(
+                type=EventType.TURN_RESUMED,
+                session_id=state.session_id,
+                turn_id=turn_id,
+                payload={"user_input": user_input, "turn_index": turn_index, "start_step_index": resume.start_step_index},
+            )
+        else:
+            yield await emit(
+                type=EventType.TURN_STARTED,
+                session_id=state.session_id,
+                turn_id=turn_id,
+                payload={"user_input": user_input, "turn_index": turn_index, "strategy": getattr(self.strategy, "name", "")},
+            )
 
-        last_model: ModelResponse | None = None
-        last_tools: list[dict[str, object]] | None = None
-        pending: list[ToolCallRequest] | None = None
+        last_model: ModelResponse | None = resume.last_model_response if resume is not None else None
+        last_tools: list[dict[str, object]] | None = resume.last_tool_results if resume is not None else None
+        pending: list[ToolCallRequest] | None = resume.pending_tool_calls if resume is not None else None
+        start_step = resume.start_step_index if resume is not None else 0
         final_output = ""
         terminal_reason = "completed"
 
         try:
-            for step_index in range(self.max_steps):
+            for step_index in range(start_step, self.max_steps):
+                if control is not None:
+                    control.check()
                 step_id = new_id("step")
                 assembled = self.assembler.assemble(
                     system_prompt=state.system_prompt,
@@ -167,7 +197,8 @@ class AgentHarness:
                     if self.dispatcher is None:
                         raise RuntimeError("CallTool requires a ToolDispatcher")
                     started_by_id: dict[str, Event] = {}
-                    for tool_call in action.calls:
+                    for tool_index, tool_call in enumerate(action.calls):
+                        key = idempotency_key(state.session_id, turn_id, step_index, tool_index, tool_call)
                         started = await emit(
                             type=EventType.TOOL_CALL_STARTED,
                             session_id=state.session_id,
@@ -177,6 +208,7 @@ class AgentHarness:
                                 "call_id": tool_call.id,
                                 "name": tool_call.name,
                                 "version": tool_call.version or "",
+                                "idempotency_key": key,
                             },
                         )
                         yield started
@@ -187,7 +219,27 @@ class AgentHarness:
                             session_id=state.session_id,
                             turn_id=turn_id,
                             step_id=step_id,
+                            step_index=step_index,
+                            recovery=recovery,
+                            in_flight_keys=in_flight_keys,
+                            confirm_commit=confirm_commit,
+                            agent_id=agent_id,
                         )
+                    except ApprovalRequired as exc:
+                        yield await emit(
+                            type=EventType.APPROVAL_REQUESTED,
+                            session_id=state.session_id,
+                            turn_id=turn_id,
+                            step_id=step_id,
+                            payload={
+                                "approval_id": exc.approval_id,
+                                "name": exc.tool_call.name,
+                                "reason": exc.reason,
+                                "idempotency_key": exc.idempotency_key,
+                                "arguments": exc.tool_call.arguments,
+                            },
+                        )
+                        return
                     except Exception as exc:
                         for tool_call in action.calls:
                             parent = started_by_id[tool_call.id]
@@ -219,6 +271,7 @@ class AgentHarness:
                                 name=result.name,
                                 tool_call_id=result.call_id,
                                 content=result.output if result.error is None else f"ERROR: {result.error}",
+                                untrusted=True,
                             )
                         )
                     self._record_workflow_output(
@@ -233,7 +286,7 @@ class AgentHarness:
                         session_id=state.session_id,
                         turn_id=turn_id,
                         step_id=step_id,
-                        payload={"index": step_index, "action": action.type, "reason": action.reason},
+                        payload=_step_completed_payload(state, step_index, action.type, action.reason),
                     )
                     break
                 elif isinstance(action, Handoff):
@@ -251,7 +304,7 @@ class AgentHarness:
                         session_id=state.session_id,
                         turn_id=turn_id,
                         step_id=step_id,
-                        payload={"index": step_index, "action": action.type},
+                        payload=_step_completed_payload(state, step_index, action.type),
                     )
                     break
                 else:
@@ -262,7 +315,7 @@ class AgentHarness:
                     session_id=state.session_id,
                     turn_id=turn_id,
                     step_id=step_id,
-                    payload={"index": step_index, "action": action.type},
+                    payload=_step_completed_payload(state, step_index, action.type),
                 )
             else:
                 terminal_reason = "max_steps"
@@ -285,6 +338,26 @@ class AgentHarness:
                     output=final_output,
                     reason=terminal_reason,
                 ),
+            )
+        except TurnPaused:
+            yield await emit(
+                type=EventType.TURN_PAUSED,
+                session_id=state.session_id,
+                turn_id=turn_id,
+                payload=_turn_completed_payload(state, turn_index=turn_index, output=final_output, reason="paused"),
+            )
+        except TurnCancelled:
+            yield await emit(
+                type=EventType.TURN_CANCELLED,
+                session_id=state.session_id,
+                turn_id=turn_id,
+                payload=_turn_completed_payload(state, turn_index=turn_index, output="", reason="cancelled"),
+            )
+            yield await emit(
+                type=EventType.TURN_COMPLETED,
+                session_id=state.session_id,
+                turn_id=turn_id,
+                payload=_turn_completed_payload(state, turn_index=turn_index, output="", reason="cancelled"),
             )
         except Exception as exc:
             yield await emit(
@@ -405,14 +478,27 @@ class AgentHarness:
                             "name": result.name,
                             "error": result.error,
                             "attempts": result.attempts,
+                            "idempotency_key": result.idempotency_key,
+                            "from_cache": result.from_cache,
+                            "skipped_non_idempotent": result.skipped_non_idempotent,
                         },
                         parent_event_id=parent_event_id,
                     )
                 )
             else:
+                event_type = (
+                    EventType.TOOL_PREPARE_COMPLETED
+                    if result.phase == "prepare"
+                    else EventType.TOOL_COMMIT_COMPLETED
+                    if result.phase == "commit"
+                    else EventType.TOOL_CALL_COMPLETED
+                )
+                if result.phase in {"prepare", "commit"}:
+                    # Always also emit TOOL_CALL_COMPLETED so replay still folds a tool message.
+                    event_type = EventType.TOOL_CALL_COMPLETED
                 yield await self.event_emitter.emit(
                     self.event_emitter.make(
-                        EventType.TOOL_CALL_COMPLETED,
+                        event_type,
                         session_id=session_id,
                         turn_id=turn_id,
                         step_id=step_id,
@@ -423,6 +509,9 @@ class AgentHarness:
                             "truncated": result.truncated,
                             "attempts": result.attempts,
                             "idempotency_key": result.idempotency_key,
+                            "from_cache": result.from_cache,
+                            "phase": result.phase,
+                            "untrusted": True,
                         },
                         parent_event_id=parent_event_id,
                     )
@@ -450,6 +539,23 @@ def _pending_from_response(response: ModelResponse, pins: dict[str, str]) -> lis
 
 def _history_without_system(messages: list[Message]) -> list[Message]:
     return [m for m in messages if m.role != MessageRole.SYSTEM]
+
+
+def _step_completed_payload(
+    state: SessionState,
+    step_index: int,
+    action_type: str,
+    reason: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "index": step_index,
+        "action": action_type,
+        "workflow_cursor": state.workflow_cursor,
+        "workflow_node_outputs": state.workflow_node_outputs,
+    }
+    if reason is not None:
+        payload["reason"] = reason
+    return payload
 
 
 def _turn_completed_payload(
