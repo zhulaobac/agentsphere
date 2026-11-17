@@ -48,6 +48,7 @@ def apply_event(state: SessionState, event: Event) -> SessionState:
                 name=payload.get("name"),
                 tool_call_id=payload.get("call_id"),
                 content=str(payload.get("output", "")),
+                untrusted=True,
             )
         )
         return state
@@ -59,8 +60,16 @@ def apply_event(state: SessionState, event: Event) -> SessionState:
                 name=payload.get("name"),
                 tool_call_id=payload.get("call_id"),
                 content=f"ERROR: {payload.get('error', '')}",
+                untrusted=True,
             )
         )
+        return state
+
+    if event.type is EventType.STEP_COMPLETED:
+        if "workflow_cursor" in payload:
+            state.workflow_cursor = payload.get("workflow_cursor")
+        if "workflow_node_outputs" in payload and payload["workflow_node_outputs"] is not None:
+            state.workflow_node_outputs = dict(payload["workflow_node_outputs"])
         return state
 
     if event.type is EventType.WORKFLOW_TRANSITION:
@@ -77,14 +86,21 @@ def apply_event(state: SessionState, event: Event) -> SessionState:
     return state
 
 
-def replay(events: Iterable[Event], session_id: str | None = None) -> SessionState:
+def replay(
+    events: Iterable[Event],
+    session_id: str | None = None,
+    initial: SessionState | None = None,
+) -> SessionState:
     events = list(events)
     sid = session_id
     if sid is None:
-        if not events:
-            raise ValueError("replay() requires events or an explicit session_id")
-        sid = events[0].session_id
-    state = empty_state(sid)
+        if initial is not None:
+            sid = initial.session_id
+        elif events:
+            sid = events[0].session_id
+        else:
+            raise ValueError("replay() requires events, an explicit session_id, or an initial state")
+    state = initial.model_copy(deep=True) if initial is not None else empty_state(sid)
     for event in events:
         state = apply_event(state, event)
     return state

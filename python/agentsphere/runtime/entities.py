@@ -13,15 +13,21 @@ from agentsphere.kernel.ids import new_id
 
 class SessionStatus(str, Enum):
     ACTIVE = "active"
+    PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"
+    CANCELLED = "cancelled"
     COMPLETED = "completed"
     FAILED = "failed"
 
 
 class TurnStatus(str, Enum):
     RUNNING = "running"
+    PAUSED = "paused"
+    WAITING_APPROVAL = "waiting_approval"
     COMPLETED = "completed"
     FAILED = "failed"
     HANDED_OFF = "handed_off"
+    CANCELLED = "cancelled"
 
 
 class Session(BaseModel):
@@ -31,6 +37,7 @@ class Session(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     system_prompt: str = ""
     tool_pins: dict[str, str] = Field(default_factory=dict)
+    agent_id: str | None = None
 
 
 class Turn(BaseModel):
