@@ -9,6 +9,8 @@ This directory is reserved for future **Go** control-plane services:
 The P1 Python Control Plane (Artifact / version / release, tenant scoping,
 Managed Runtime Provider) lives under `python/agentsphere/controlplane/`. The
 evaluation foundation (datasets, evaluators, Experiment, Gate) lives under
-`python/agentsphere/evaluation/`. Do not place Python packages here; keep this
-tree as a sibling of `python/` so a later Go module can implement the same
-contracts without mixing into the Kernel or Runtime.
+`python/agentsphere/evaluation/`. Anchor Tenant packs (product-team first)
+live under `python/agentsphere/tenants/` and speak those Python contracts.
+Do not place Python packages here; keep this tree as a sibling of `python/`
+so a later Go module can implement the same contracts without mixing into
+the Kernel or Runtime.
