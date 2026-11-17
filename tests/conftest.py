@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from agentsphere.controlplane import Principal
 from agentsphere.tool_registry import RiskLevel, ToolRegistry, ToolSpec
 
 
@@ -36,3 +37,13 @@ def registry(echo_spec: ToolSpec) -> ToolRegistry:
     tools = ToolRegistry()
     tools.register(echo_spec)
     return tools
+
+
+@pytest.fixture
+def principal() -> Principal:
+    return Principal(name="alice", tenant="acme", owner="alice", team="platform")
+
+
+@pytest.fixture
+def other_tenant() -> Principal:
+    return Principal(name="bob", tenant="other", owner="bob", team="ops")

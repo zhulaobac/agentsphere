@@ -5,17 +5,22 @@ Enterprise agent production platform. This repository is a **monorepo**.
 P0 delivered the skeleton: Harness Kernel (ReAct + Workflow), Model Adapter,
 basic Runtime (Session / Turn / Event), Tool Registry v1, and basic Trace.
 
-P1 (this slice) adds Managed Runtime recovery and the security execution
+P1 first slice added Managed Runtime recovery and the security execution
 substrate: checkpoints, worker leases, idempotent tool execution, pause /
 resume / cancel, HITL, Sandbox, Agent Identity, Credential Vault, policy, and
-audit. Control Plane (Artifact/version/release), Evaluation, Memory/RAG, MCP
-Gateway, Planner-Executor, Multi-Agent, BYO hosting, cost governance, and
-Anchor Tenant integration are still out of scope.
+audit.
+
+P1 second slice (this tree) adds the Python Control Plane (unified Agent
+Artifact, versioned assets, lifecycle, canary/full release, rollback, tenant
+scoping, Managed Runtime Provider) and the Evaluation foundation (datasets,
+pluggable evaluators, Experiment, regression, Release Gate). Memory/RAG, MCP
+Gateway, Planner-Executor, Multi-Agent, BYO hosting, cost governance, online
+sampling, the evolver, and Anchor Tenant integration remain out of scope.
 
 ## Layout
 
 ```
-python/agentsphere/          # Python packages (Kernel + Runtime + security)
+python/agentsphere/          # Python packages (Kernel + Runtime + security + P1 CP/Eval)
   kernel/                    # Harness: loop, context, dispatcher, middleware, events
     loop/                    # ReAct + Workflow strategies; extension registry
   model_adapter/             # Unified model API + mock provider (no network)
@@ -24,9 +29,11 @@ python/agentsphere/          # Python packages (Kernel + Runtime + security)
   trace/                     # Session → Turn → Step → Model/Tool Call (OpenTelemetry)
   sandbox/                   # Sandbox protocol + isolated-subprocess backend
   identity/                  # Agent Identity, Credential Vault, policy, audit
-control-plane/               # Reserved for future Go services
+  controlplane/              # Artifact Registry, lifecycle, release, Runtime Provider
+  evaluation/                # Datasets, evaluators, Experiment, regression, Gate
+control-plane/               # Reserved for future Go services (same contracts)
 tests/                       # Unit + integration tests (offline)
-.github/workflows/ci.yml     # GitHub Actions: install deps, run pytest
+.github/workflows/ci.yml     # GitHub Actions: pytest + fixture Release Gate
 ```
 
 The Kernel is essentially pure: `(session_state, user_input) → events`. It does
@@ -35,8 +42,9 @@ are durable; a step is complete only then. Recovery loads the latest
 `Checkpoint`, replays remaining events, and continues under a worker `lease`.
 
 Pluggable production backends (not required in CI): Kafka event log,
-Firecracker/gVisor/Kata sandbox, HashiCorp Vault/SPIFFE, OPA/Cedar. Local
-SQLite / in-memory / subprocess implementations sit behind the same interfaces.
+Firecracker/gVisor/Kata sandbox, HashiCorp Vault/SPIFFE, OPA/Cedar, Kubernetes
+deploy, LLM-as-Judge providers. Local SQLite / in-memory / subprocess /
+scripted-evaluator implementations sit behind the same interfaces.
 
 ## Requirements
 
@@ -57,12 +65,18 @@ P0 and P1 tests run together. Useful subsets:
 pytest tests/test_runtime_replay.py tests/test_harness.py          # P0
 pytest tests/test_checkpoint_and_idempotency.py tests/test_lease.py \
        tests/test_pause_resume_cancel.py tests/test_sandbox.py \
-       tests/test_vault_identity_audit.py                          # P1
+       tests/test_vault_identity_audit.py                          # P1 recovery/sandbox/vault
+pytest tests/test_controlplane_artifacts.py tests/test_lifecycle.py \
+       tests/test_controlplane_auth.py tests/test_release.py \
+       tests/test_evaluation.py tests/test_experiment.py \
+       tests/test_gate.py tests/test_ci_gate.py                          # P1 CP + Eval
+python -m agentsphere.evaluation.ci_gate                          # fixture Release Gate
 ```
 
-CI runs `pytest` on `main` and on pull requests, and prints sandbox capability
-probe output (user/net namespaces, Landlock). Sandbox tests that need those
-capabilities skip with a clear reason when they are genuinely absent.
+CI runs `pytest` then `python -m agentsphere.evaluation.ci_gate` on `main` and
+on pull requests, and prints sandbox capability probe output (user/net
+namespaces, Landlock). Sandbox tests that need those capabilities skip with a
+clear reason when they are genuinely absent.
 
 ### Sandbox backend notes (ubuntu-latest)
 
@@ -88,6 +102,11 @@ from agentsphere import (
     InMemoryVault,         # Credential Vault (short-lived tokens; secrets never enter model context)
     StaticPolicyEngine,    # default-deny policy; high-risk → HITL
     SubprocessSandbox,     # Sandbox: rlimits, default-deny net, scoped filesystem
+    ControlPlane,          # Artifact Registry, lifecycle, canary/full release, rollback
+    AgentArtifact,         # apiVersion agentsphere/v1, kind Agent
+    ManagedRuntimeProvider,# Control Plane → existing Managed Runtime (not a second runtime)
+    ExperimentRunner,      # (agent version, dataset version, evaluator version, env)
+    ReleaseGate,           # mandatory check before Approved → Released
 )
 ```
 
