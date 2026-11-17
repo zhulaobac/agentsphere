@@ -5,9 +5,13 @@ from pathlib import Path
 import pytest
 
 from agentsphere.kernel.events import Event, EventType
+from agentsphere.kernel.loop import WorkflowDefinition, WorkflowEdge, WorkflowNode, WorkflowStrategy
+from agentsphere.model_adapter import MockModelProvider, ModelAdapter
+from agentsphere.model_adapter.provider import ModelAdapterError
 from agentsphere.model_adapter.types import MessageRole
-from agentsphere.runtime import InMemoryEventStore, SqliteEventStore, replay
+from agentsphere.runtime import InMemoryEventStore, SqliteEventStore, build_runtime, replay
 from agentsphere.runtime.entities import Session, Turn, TurnStatus
+from agentsphere.tool_registry import RiskLevel, ToolRegistry, ToolSpec
 
 
 def _events(session_id: str) -> list[Event]:
@@ -98,3 +102,56 @@ async def test_sqlite_store_roundtrip(tmp_path: Path) -> None:
     turns = await reopened.list_turns("s4")
     assert turns[0].turn_id == "t1"
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_error_path_preserves_workflow_and_emits_model_call_started() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="echo",
+            version="1.0.0",
+            owner="platform",
+            json_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+            risk_level=RiskLevel.LOW,
+            idempotent=True,
+            handler=lambda args: args["text"],
+        )
+    )
+    definition = WorkflowDefinition(
+        start="ask",
+        nodes=[
+            WorkflowNode(id="ask", type="model"),
+            WorkflowNode(id="echo", type="tool", tool_name="echo", arguments={"text": "{{user_input}}"}),
+            WorkflowNode(id="done", type="end", output="ok"),
+        ],
+        edges=[
+            WorkflowEdge(source="ask", target="echo"),
+            WorkflowEdge(source="echo", target="done"),
+        ],
+    )
+    runtime = build_runtime(
+        adapter=ModelAdapter(MockModelProvider(script=[RuntimeError("boom")])),
+        registry=registry,
+        strategy=WorkflowStrategy(definition),
+        store=InMemoryEventStore(),
+    )
+    session = await runtime.create_session()
+    caught: list[Event] = []
+    with pytest.raises(ModelAdapterError):
+        async for event in runtime.run_turn(session.session_id, "ping"):
+            caught.append(event)
+
+    types = [event.type for event in caught]
+    assert EventType.MODEL_CALL_STARTED in types
+    assert EventType.MODEL_CALL_FAILED in types
+    assert EventType.MODEL_CALL_COMPLETED not in types
+    assert types.index(EventType.MODEL_CALL_STARTED) < types.index(EventType.MODEL_CALL_FAILED)
+    completed = next(event for event in caught if event.type is EventType.TURN_COMPLETED)
+    assert completed.payload["reason"] == "error"
+    assert completed.payload["workflow_cursor"] == "ask"
+    assert completed.payload["workflow_node_outputs"] == {}
+
+    rebuilt = replay(await runtime.list_events(session.session_id))
+    assert rebuilt.workflow_cursor == "ask"
+    assert rebuilt.workflow_node_outputs == {}

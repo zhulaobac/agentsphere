@@ -72,7 +72,11 @@ class WorkflowStrategy:
 
     def step(self, ctx: TurnContext) -> CallModel | CallTool | Finish:
         state = ctx.session_state
-        if not state.workflow_cursor:
+        # P0 has no wait-for-user / resume node: each turn restarts the DAG.
+        if ctx.step_index == 0:
+            state.workflow_cursor = self.definition.start
+            state.workflow_node_outputs = {}
+        elif not state.workflow_cursor:
             state.workflow_cursor = self.definition.start
 
         # Bound DAG walks so a cycle cannot livelock the Kernel.

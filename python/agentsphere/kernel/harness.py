@@ -55,6 +55,9 @@ class AgentHarness:
         turn_index = state.turn_index + 1
         state.turn_index = turn_index
         state.messages.append(Message(role=MessageRole.USER, content=user_input))
+        # P0 has no wait-for-user / resume node: every turn restarts the workflow DAG.
+        state.workflow_cursor = None
+        state.workflow_node_outputs = {}
 
         async def emit(**kwargs: object) -> Event:
             event = self.event_emitter.make(**kwargs)  # type: ignore[arg-type]
@@ -75,7 +78,7 @@ class AgentHarness:
         terminal_reason = "completed"
 
         try:
-            for step_index in range(self.max_steps + 1):
+            for step_index in range(self.max_steps):
                 step_id = new_id("step")
                 assembled = self.assembler.assemble(
                     system_prompt=state.system_prompt,
@@ -110,8 +113,38 @@ class AgentHarness:
                         tools=action.tools,
                         params=action.params,
                     )
-                    response = await self._call_model(request, state, turn_id, step_id)
-                    async for event in self._model_events(state.session_id, turn_id, step_id, request, response):
+                    started = await emit(
+                        type=EventType.MODEL_CALL_STARTED,
+                        session_id=state.session_id,
+                        turn_id=turn_id,
+                        step_id=step_id,
+                        payload={
+                            "provider": self.model_adapter.primary.name,
+                            "tool_count": len(request.tools),
+                            "message_count": len(request.messages),
+                            "stream": request.params.stream,
+                        },
+                    )
+                    yield started
+                    try:
+                        response = await self._call_model(request, state, turn_id, step_id)
+                    except Exception as exc:
+                        yield await emit(
+                            type=EventType.MODEL_CALL_FAILED,
+                            session_id=state.session_id,
+                            turn_id=turn_id,
+                            step_id=step_id,
+                            payload={
+                                "error": str(exc),
+                                "error_type": type(exc).__name__,
+                                "provider": self.model_adapter.primary.name,
+                            },
+                            parent_event_id=started.event_id,
+                        )
+                        raise
+                    async for event in self._model_completion_events(
+                        state.session_id, turn_id, step_id, request, response, started.event_id
+                    ):
                         yield event
                     last_model = response
                     pending = _pending_from_response(response, state.tool_pins)
@@ -133,13 +166,48 @@ class AgentHarness:
                 elif isinstance(action, CallTool):
                     if self.dispatcher is None:
                         raise RuntimeError("CallTool requires a ToolDispatcher")
-                    results = await self.dispatcher.dispatch(
-                        action.calls,
-                        session_id=state.session_id,
-                        turn_id=turn_id,
-                        step_id=step_id,
-                    )
-                    async for event in self._tool_events(state.session_id, turn_id, step_id, results):
+                    started_by_id: dict[str, Event] = {}
+                    for tool_call in action.calls:
+                        started = await emit(
+                            type=EventType.TOOL_CALL_STARTED,
+                            session_id=state.session_id,
+                            turn_id=turn_id,
+                            step_id=step_id,
+                            payload={
+                                "call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "version": tool_call.version or "",
+                            },
+                        )
+                        yield started
+                        started_by_id[tool_call.id] = started
+                    try:
+                        results = await self.dispatcher.dispatch(
+                            action.calls,
+                            session_id=state.session_id,
+                            turn_id=turn_id,
+                            step_id=step_id,
+                        )
+                    except Exception as exc:
+                        for tool_call in action.calls:
+                            parent = started_by_id[tool_call.id]
+                            yield await emit(
+                                type=EventType.TOOL_CALL_FAILED,
+                                session_id=state.session_id,
+                                turn_id=turn_id,
+                                step_id=step_id,
+                                payload={
+                                    "call_id": tool_call.id,
+                                    "name": tool_call.name,
+                                    "error": str(exc),
+                                    "error_type": type(exc).__name__,
+                                },
+                                parent_event_id=parent.event_id,
+                            )
+                        raise
+                    async for event in self._tool_result_events(
+                        state.session_id, turn_id, step_id, results, started_by_id
+                    ):
                         yield event
                     last_tools = [r.model_dump() for r in results]
                     pending = None
@@ -211,14 +279,12 @@ class AgentHarness:
                 type=EventType.TURN_COMPLETED,
                 session_id=state.session_id,
                 turn_id=turn_id,
-                payload={
-                    "output": final_output,
-                    "reason": terminal_reason,
-                    "turn_index": turn_index,
-                    "workflow_cursor": state.workflow_cursor,
-                    "workflow_node_outputs": state.workflow_node_outputs,
-                    "messages": [m.model_dump(mode="json") for m in state.messages],
-                },
+                payload=_turn_completed_payload(
+                    state,
+                    turn_index=turn_index,
+                    output=final_output,
+                    reason=terminal_reason,
+                ),
             )
         except Exception as exc:
             yield await emit(
@@ -231,7 +297,12 @@ class AgentHarness:
                 type=EventType.TURN_COMPLETED,
                 session_id=state.session_id,
                 turn_id=turn_id,
-                payload={"output": "", "reason": "error", "turn_index": turn_index},
+                payload=_turn_completed_payload(
+                    state,
+                    turn_index=turn_index,
+                    output="",
+                    reason="error",
+                ),
             )
             raise
 
@@ -275,29 +346,15 @@ class AgentHarness:
             after_core,
         )
 
-    async def _model_events(
+    async def _model_completion_events(
         self,
         session_id: str,
         turn_id: str,
         step_id: str,
         request: ModelRequest,
         response: ModelResponse,
+        parent_event_id: str,
     ) -> AsyncIterator[Event]:
-        started = await self.event_emitter.emit(
-            self.event_emitter.make(
-                EventType.MODEL_CALL_STARTED,
-                session_id=session_id,
-                turn_id=turn_id,
-                step_id=step_id,
-                payload={
-                    "provider": response.provider,
-                    "tool_count": len(request.tools),
-                    "message_count": len(request.messages),
-                    "stream": request.params.stream,
-                },
-            )
-        )
-        yield started
         if request.params.stream and response.content:
             yield await self.event_emitter.emit(
                 self.event_emitter.make(
@@ -306,7 +363,7 @@ class AgentHarness:
                     turn_id=turn_id,
                     step_id=step_id,
                     payload={"delta": response.content},
-                    parent_event_id=started.event_id,
+                    parent_event_id=parent_event_id,
                 )
             )
         yield await self.event_emitter.emit(
@@ -321,33 +378,21 @@ class AgentHarness:
                     "usage": response.usage.model_dump(),
                     "provider": response.provider,
                 },
-                parent_event_id=started.event_id,
+                parent_event_id=parent_event_id,
             )
         )
 
-    async def _tool_events(
+    async def _tool_result_events(
         self,
         session_id: str,
         turn_id: str,
         step_id: str,
         results: list[ToolResult],
+        started_by_id: dict[str, Event],
     ) -> AsyncIterator[Event]:
         for result in results:
-            started = await self.event_emitter.emit(
-                self.event_emitter.make(
-                    EventType.TOOL_CALL_STARTED,
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    step_id=step_id,
-                    payload={
-                        "call_id": result.call_id,
-                        "name": result.name,
-                        "version": result.version,
-                        "idempotency_key": result.idempotency_key,
-                    },
-                )
-            )
-            yield started
+            parent = started_by_id.get(result.call_id)
+            parent_event_id = parent.event_id if parent is not None else None
             if result.error:
                 yield await self.event_emitter.emit(
                     self.event_emitter.make(
@@ -361,7 +406,7 @@ class AgentHarness:
                             "error": result.error,
                             "attempts": result.attempts,
                         },
-                        parent_event_id=started.event_id,
+                        parent_event_id=parent_event_id,
                     )
                 )
             else:
@@ -379,7 +424,7 @@ class AgentHarness:
                             "attempts": result.attempts,
                             "idempotency_key": result.idempotency_key,
                         },
-                        parent_event_id=started.event_id,
+                        parent_event_id=parent_event_id,
                     )
                 )
 
@@ -405,3 +450,20 @@ def _pending_from_response(response: ModelResponse, pins: dict[str, str]) -> lis
 
 def _history_without_system(messages: list[Message]) -> list[Message]:
     return [m for m in messages if m.role != MessageRole.SYSTEM]
+
+
+def _turn_completed_payload(
+    state: SessionState,
+    *,
+    turn_index: int,
+    output: str,
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "output": output,
+        "reason": reason,
+        "turn_index": turn_index,
+        "workflow_cursor": state.workflow_cursor,
+        "workflow_node_outputs": state.workflow_node_outputs,
+        "messages": [m.model_dump(mode="json") for m in state.messages],
+    }

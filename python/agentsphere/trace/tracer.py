@@ -48,6 +48,7 @@ _END = {
     EventType.TURN_COMPLETED: "turn",
     EventType.STEP_COMPLETED: "step",
     EventType.MODEL_CALL_COMPLETED: "model.call",
+    EventType.MODEL_CALL_FAILED: "model.call",
     EventType.MODEL_CALL_DELTA: None,
     EventType.TOOL_CALL_COMPLETED: "tool.call",
     EventType.TOOL_CALL_FAILED: "tool.call",
@@ -106,7 +107,7 @@ class TraceRecorder:
             span = self._live_spans.pop(node_key, None)
             node = self._nodes[session_id].get(node_key)
             if span is not None:
-                if event.type is EventType.TOOL_CALL_FAILED or (
+                if event.type in {EventType.TOOL_CALL_FAILED, EventType.MODEL_CALL_FAILED} or (
                     event.type is EventType.TURN_COMPLETED and event.payload.get("reason") == "error"
                 ):
                     span.set_status(Status(StatusCode.ERROR))

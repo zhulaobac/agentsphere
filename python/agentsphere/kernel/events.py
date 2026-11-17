@@ -25,6 +25,7 @@ class EventType(str, Enum):
     MODEL_CALL_STARTED = "model.call.started"
     MODEL_CALL_DELTA = "model.call.delta"
     MODEL_CALL_COMPLETED = "model.call.completed"
+    MODEL_CALL_FAILED = "model.call.failed"
     TOOL_CALL_STARTED = "tool.call.started"
     TOOL_CALL_COMPLETED = "tool.call.completed"
     TOOL_CALL_FAILED = "tool.call.failed"

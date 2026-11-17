@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -8,6 +9,7 @@ import pytest
 
 from agentsphere.kernel.actions import ToolCallRequest
 from agentsphere.kernel.dispatcher import DispatcherConfig, ToolDispatcher
+from agentsphere.kernel.middleware import MiddlewareStage
 from agentsphere.tool_registry import RiskLevel, ToolRegistry, ToolSpec
 
 
@@ -101,3 +103,59 @@ async def test_dispatcher_timeout_and_truncation() -> None:
     )
     assert truncated[0].truncated is True
     assert truncated[0].output.endswith("[truncated]")
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_timeout_applies_to_blocking_sync_handler() -> None:
+    def blocking(_arguments: Mapping[str, Any]) -> str:
+        time.sleep(0.4)
+        return "late"
+
+    dispatcher = ToolDispatcher(
+        _registry(blocking, name="block"),
+        config=DispatcherConfig(timeout_seconds=0.05, max_retries=0),
+    )
+    started = time.perf_counter()
+    results = await dispatcher.dispatch(
+        [ToolCallRequest(id="c1", name="block", arguments={"text": "x"})],
+        session_id="s",
+        turn_id="t",
+        step_id="st",
+    )
+    elapsed = time.perf_counter() - started
+    assert results[0].error is not None
+    assert "timed out" in results[0].error
+    assert elapsed < 0.25
+
+
+class _BoomAfterTool:
+    async def wrap(self, stage: MiddlewareStage, payload: Any, nxt: Any) -> Any:
+        result = await nxt(payload)
+        if stage is MiddlewareStage.AFTER_TOOL:
+            raise RuntimeError("hook failed")
+        return result
+
+
+@pytest.mark.asyncio
+async def test_after_tool_failure_does_not_reinvoke_handler() -> None:
+    calls = {"n": 0}
+
+    def once(arguments: Mapping[str, Any]) -> str:
+        calls["n"] += 1
+        return str(arguments["text"])
+
+    dispatcher = ToolDispatcher(
+        _registry(once),
+        config=DispatcherConfig(max_retries=2, retry_backoff_seconds=0.0, timeout_seconds=1.0),
+        middlewares=[_BoomAfterTool()],
+    )
+    results = await dispatcher.dispatch(
+        [ToolCallRequest(id="c1", name="echo", arguments={"text": "ok"})],
+        session_id="s",
+        turn_id="t",
+        step_id="st",
+    )
+    assert calls["n"] == 1
+    assert results[0].error is not None
+    assert "after_tool middleware failed" in results[0].error
+    assert "hook failed" in results[0].error

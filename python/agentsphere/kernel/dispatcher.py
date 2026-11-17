@@ -115,6 +115,8 @@ class ToolDispatcher:
         attempts = 0
         last_error: str | None = None
         max_tries = 1 + max(0, self.config.max_retries)
+        raw: Any = None
+        succeeded = False
 
         while attempts < max_tries:
             attempts += 1
@@ -132,22 +134,8 @@ class ToolDispatcher:
                     ),
                     timeout=self.config.timeout_seconds,
                 )
-                after = await run_chain(
-                    self.middlewares,
-                    MiddlewareStage.AFTER_TOOL,
-                    raw,
-                    _identity,
-                )
-                text, truncated = _truncate(_stringify(after), self.config.max_result_chars)
-                return ToolResult(
-                    call_id=call.id,
-                    name=call.name,
-                    version=tool.version,
-                    output=text,
-                    truncated=truncated,
-                    attempts=attempts,
-                    idempotency_key=key,
-                )
+                succeeded = True
+                break
             except TimeoutError:
                 last_error = f"tool timed out after {self.config.timeout_seconds}s"
             except Exception as exc:  # noqa: BLE001
@@ -157,11 +145,41 @@ class ToolDispatcher:
             if attempts < max_tries:
                 await asyncio.sleep(self.config.retry_backoff_seconds * attempts)
 
+        if not succeeded:
+            return ToolResult(
+                call_id=call.id,
+                name=call.name,
+                version=tool.version,
+                error=last_error or "tool failed",
+                attempts=attempts,
+                idempotency_key=key,
+            )
+
+        # after_tool runs only after a successful invoke and must not re-enter the retry loop.
+        try:
+            after = await run_chain(
+                self.middlewares,
+                MiddlewareStage.AFTER_TOOL,
+                raw,
+                _identity,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(
+                call_id=call.id,
+                name=call.name,
+                version=tool.version,
+                error=f"after_tool middleware failed: {exc}",
+                attempts=attempts,
+                idempotency_key=key,
+            )
+
+        text, truncated = _truncate(_stringify(after), self.config.max_result_chars)
         return ToolResult(
             call_id=call.id,
             name=call.name,
             version=tool.version,
-            error=last_error or "tool failed",
+            output=text,
+            truncated=truncated,
             attempts=attempts,
             idempotency_key=key,
         )
@@ -172,7 +190,15 @@ async def _identity(payload: Any) -> Any:
 
 
 async def _call_handler(handler: Callable[..., Any], arguments: Mapping[str, Any]) -> Any:
-    result = handler(dict(arguments))
+    """Run async handlers on the loop; run sync handlers in a worker thread so timeouts apply."""
+    args = dict(arguments)
+    if inspect.iscoroutinefunction(handler):
+        return await handler(args)
+
+    def run_sync() -> Any:
+        return handler(args)
+
+    result = await asyncio.to_thread(run_sync)
     if inspect.isawaitable(result):
         return await result
     return result

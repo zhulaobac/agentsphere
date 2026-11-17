@@ -24,6 +24,9 @@ def apply_event(state: SessionState, event: Event) -> SessionState:
     if event.type is EventType.TURN_STARTED:
         state.turn_index = int(payload.get("turn_index", state.turn_index + 1))
         state.messages.append(Message(role=MessageRole.USER, content=str(payload.get("user_input", ""))))
+        # Each turn restarts the DAG; TURN_COMPLETED restores progress if the turn failed mid-workflow.
+        state.workflow_cursor = None
+        state.workflow_node_outputs = {}
         return state
 
     if event.type is EventType.MODEL_CALL_COMPLETED:
