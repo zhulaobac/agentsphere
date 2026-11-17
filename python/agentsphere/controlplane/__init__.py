@@ -30,6 +30,7 @@ from agentsphere.controlplane.errors import (
     LifecycleError,
 )
 from agentsphere.controlplane.events import ControlEvent, ControlEventType
+from agentsphere.controlplane.gate import derived_passed, verify_gate_decision
 from agentsphere.controlplane.lifecycle import ALLOWED_TRANSITIONS
 from agentsphere.controlplane.release import CANARY_WEIGHT, FULL_WEIGHT, DeploymentRecord
 from agentsphere.controlplane.runtime import ControlRuntimeProvider, DeploymentBinding, ManagedRuntimeProvider
@@ -98,4 +99,6 @@ __all__ = [
     "SLOSignal",
     "assert_can_mutate",
     "assert_can_read",
+    "derived_passed",
+    "verify_gate_decision",
 ]

@@ -17,6 +17,7 @@ from agentsphere.controlplane import (
     Principal,
     ReleaseChannel,
 )
+from tests.experiment_stubs import stub_experiment_run
 
 
 async def _ready_draft(cp: ControlPlane, principal: Principal, *, version: str = "0.1.0") -> AgentArtifact:
@@ -44,17 +45,13 @@ async def test_happy_path_and_event_audit(principal: Principal) -> None:
     await _ready_draft(cp, principal)
     built = await cp.build("bot", "0.1.0", principal)
     assert built.status.phase is LifecyclePhase.BUILT
+    cp.register_experiment(stub_experiment_run("exp_1", "bot", "0.1.0"))
     evaluated = await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp_1")
     assert evaluated.status.phase is LifecyclePhase.EVALUATED
     approved = await cp.approve("bot", "0.1.0", principal, reason="looks good")
     assert approved.status.phase is LifecyclePhase.APPROVED
-    released, dep = await cp.release(
-        "bot",
-        "0.1.0",
-        principal,
-        GateDecision(passed=True, reason="fixture"),
-        channel=ReleaseChannel.CANARY,
-    )
+    await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp_1")
+    released, dep = await cp.release("bot", "0.1.0", principal, channel=ReleaseChannel.CANARY)
     assert released.status.phase is LifecyclePhase.RELEASED
     assert released.status.releaseChannel is ReleaseChannel.CANARY
     assert dep.weight == 0.05
@@ -62,7 +59,7 @@ async def test_happy_path_and_event_audit(principal: Principal) -> None:
     assert deprecated.status.phase is LifecyclePhase.DEPRECATED
     retired = await cp.retire("bot", "0.1.0", principal)
     assert retired.status.phase is LifecyclePhase.RETIRED
-    events = cp.events_for(retired.resource_key(), tenant=principal.tenant)
+    events = cp.events_for(retired.resource_key(), principal)
     types = [e.type.value for e in events]
     assert types.count("lifecycle.transition") >= 6
     assert "approval.recorded" in types
@@ -101,13 +98,19 @@ async def test_release_without_passing_gate_is_rejected(principal: Principal) ->
     cp = ControlPlane()
     await _ready_draft(cp, principal)
     await cp.build("bot", "0.1.0", principal)
+    cp.register_experiment(stub_experiment_run("exp", "bot", "0.1.0", pass_rate=0.0))
     await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp")
     await cp.approve("bot", "0.1.0", principal)
+    await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp")
     with pytest.raises(GateFailedError) as exc:
-        await cp.release("bot", "0.1.0", principal, GateDecision(passed=False, reason="quality"))
+        await cp.release("bot", "0.1.0", principal)
     assert exc.value.decision is not None
     assert exc.value.decision.passed is False
     artifact = await cp.get_artifact("bot", "0.1.0", principal)
     assert artifact.status.phase is LifecyclePhase.APPROVED
-    blocked = [e for e in cp.events_for(artifact.resource_key(), tenant=principal.tenant) if e.type.value == "release.blocked"]
+    blocked = [
+        e
+        for e in cp.events_for(artifact.resource_key(), principal)
+        if e.type.value == "release.blocked"
+    ]
     assert blocked

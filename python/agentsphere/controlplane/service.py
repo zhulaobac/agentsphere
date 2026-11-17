@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from packaging.version import Version
+
 from agentsphere.controlplane.artifact import AgentArtifact, AgentStatus, DeployedVersion
 from agentsphere.controlplane.assets import STUB_KINDS, AssetRecord, DependencyEdge
 from agentsphere.controlplane.auth import assert_can_mutate, assert_can_read, assert_same_tenant
@@ -18,6 +20,7 @@ from agentsphere.controlplane.errors import (
     LifecycleError,
 )
 from agentsphere.controlplane.events import ControlEvent, ControlEventType
+from agentsphere.controlplane.gate import derived_passed, verify_gate_decision
 from agentsphere.controlplane.lifecycle import assert_can_release, assert_transition_allowed
 from agentsphere.controlplane.release import CANARY_WEIGHT, FULL_WEIGHT, DeploymentRecord
 from agentsphere.controlplane.runtime import ControlRuntimeProvider, DeploymentBinding
@@ -28,6 +31,7 @@ from agentsphere.controlplane.types import (
     AssetRef,
     DeploymentStatus,
     GateDecision,
+    GateThresholds,
     LifecyclePhase,
     Principal,
     ReleaseChannel,
@@ -45,6 +49,22 @@ class ControlPlane:
     ) -> None:
         self.store = store or InMemoryControlStore()
         self.runtime = runtime
+        self._experiments: dict[str, Any] = {}
+
+    def register_experiment(self, run: Any) -> Any:
+        """Index a stored ExperimentRun so evaluation and Gate can look it up by id."""
+        run_id = getattr(run, "run_id", None)
+        if not run_id:
+            raise LifecycleError("experiment run is missing run_id")
+        stored = run.model_copy(deep=True) if hasattr(run, "model_copy") else run
+        self._experiments[str(run_id)] = stored
+        return stored
+
+    def get_experiment(self, run_id: str) -> Any | None:
+        item = self._experiments.get(run_id)
+        if item is None:
+            return None
+        return item.model_copy(deep=True) if hasattr(item, "model_copy") else item
 
     async def put_asset(
         self,
@@ -56,19 +76,16 @@ class ControlPlane:
         principal: Principal,
         replace: bool = False,
     ) -> AssetRecord:
-        assert_same_tenant(principal, metadata.tenant, action="create", resource=f"{kind.value}/{metadata.name}")
+        resource = f"{kind.value}/{metadata.name}@{version}"
         existing = self.store.get_asset(kind, metadata.tenant, metadata.name, version)
-        if existing is not None:
-            if existing.immutable and not replace:
+        if existing is None:
+            assert_can_mutate(principal, metadata, action="create", resource=resource)
+        else:
+            if existing.immutable or self._is_experiment_pinned(existing):
                 raise ImmutableAssetError(f"{kind.value}/{metadata.name}@{version} is immutable")
             if not replace:
                 raise DuplicateAssetError(f"{kind.value}/{metadata.name}@{version} already exists")
-            assert_can_mutate(
-                principal,
-                existing.metadata,
-                action="update",
-                resource=f"{kind.value}/{metadata.name}@{version}",
-            )
+            assert_can_mutate(principal, existing.metadata, action="update", resource=resource)
         record = AssetRecord(
             kind=kind,
             metadata=metadata,
@@ -116,7 +133,6 @@ class ControlPlane:
     async def put_artifact(self, artifact: AgentArtifact, principal: Principal) -> AgentArtifact:
         meta = artifact.metadata
         resource = artifact.resource_key()
-        assert_same_tenant(principal, meta.tenant, action="create", resource=resource)
         existing = self.store.get_artifact(meta.tenant, meta.name, artifact.version)
         if existing is not None:
             if existing.status.phase is not LifecyclePhase.DRAFT:
@@ -130,6 +146,7 @@ class ControlPlane:
             )
             event_type = ControlEventType.ARTIFACT_UPDATED
         else:
+            assert_can_mutate(principal, meta, action="create", resource=resource)
             artifact = artifact.model_copy(
                 update={"status": AgentStatus(phase=LifecyclePhase.DRAFT)},
                 deep=True,
@@ -187,6 +204,14 @@ class ControlPlane:
         assert_transition_allowed(artifact.status.phase, LifecyclePhase.EVALUATED)
         if not experiment_run_id:
             raise LifecycleError("cannot mark Evaluated without an experiment run id")
+        run = self.get_experiment(experiment_run_id)
+        if run is None:
+            raise LifecycleError(f"unknown experiment run {experiment_run_id}")
+        spec = getattr(run, "spec", None)
+        if spec is not None and (spec.agent_name != name or spec.agent_version != version):
+            raise LifecycleError(
+                f"experiment run {experiment_run_id} does not belong to {name}@{version}"
+            )
         artifact.status.lastExperimentRunId = experiment_run_id
         await self._emit(
             ControlEventType.EVALUATION_RECORDED,
@@ -214,22 +239,69 @@ class ControlPlane:
         )
         return await self._transition(artifact, LifecyclePhase.APPROVED, principal, details={"reason": reason})
 
+    async def record_gate(
+        self,
+        name: str,
+        version: str,
+        principal: Principal,
+        *,
+        experiment_run_id: str | None = None,
+        thresholds: GateThresholds | None = None,
+        baseline_run_id: str | None = None,
+    ) -> tuple[AgentArtifact, GateDecision]:
+        """Persist a GateDecision produced only by ReleaseGate.evaluate on a stored run."""
+        artifact = await self._require_mutable(name, version, principal, action="record_gate")
+        run_id = experiment_run_id or artifact.status.lastExperimentRunId
+        if not run_id:
+            raise LifecycleError("cannot record a Gate without an experiment run id")
+        run = self.get_experiment(run_id)
+        if run is None:
+            raise LifecycleError(f"unknown experiment run {run_id}")
+        spec = getattr(run, "spec", None)
+        if spec is not None and (spec.agent_name != name or spec.agent_version != version):
+            raise LifecycleError(f"experiment run {run_id} does not belong to {name}@{version}")
+        baseline = self.get_experiment(baseline_run_id) if baseline_run_id else None
+        from agentsphere.evaluation.gate import ReleaseGate
+
+        decision = ReleaseGate().evaluate(run, thresholds=thresholds, baseline=baseline)
+        if decision.passed != derived_passed(decision):
+            raise GateFailedError(
+                "inconsistent GateDecision: passed does not match non-skipped checks",
+                decision=decision,
+            )
+        gate_id = new_id("gate")
+        self.store.put_gate(gate_id, decision)
+        artifact.status.lastGateResultId = gate_id
+        stored_artifact = self.store.put_artifact(artifact)
+        await self._sync_agent_asset(stored_artifact, principal)
+        await self._emit(
+            ControlEventType.GATE_RECORDED,
+            principal,
+            resource=stored_artifact.resource_key(),
+            tenant=stored_artifact.metadata.tenant,
+            details={
+                "gate_id": gate_id,
+                "passed": decision.passed,
+                "experiment_run_id": decision.experiment_run_id,
+            },
+        )
+        return stored_artifact, decision
+
     async def release(
         self,
         name: str,
         version: str,
         principal: Principal,
-        gate: GateDecision,
+        gate: GateDecision | None = None,
         *,
+        gate_id: str | None = None,
         channel: ReleaseChannel = ReleaseChannel.CANARY,
         weight: float | None = None,
         environment: str = "default",
         reason: str = "",
     ) -> tuple[AgentArtifact, DeploymentRecord]:
         artifact = await self._require_mutable(name, version, principal, action="release")
-        try:
-            assert_can_release(artifact.status.phase, gate)
-        except LifecycleError:
+        if artifact.status.phase is not LifecyclePhase.APPROVED:
             await self._emit(
                 ControlEventType.RELEASE_BLOCKED,
                 principal,
@@ -241,30 +313,54 @@ class ControlPlane:
                     "reason": "gate_or_phase",
                 },
             )
-            if gate is None or not gate.passed:
-                raise GateFailedError("cannot Release without a passing Gate", decision=gate) from None
-            raise
-
-        if not gate.passed:
+            raise LifecycleError(f"cannot Release from phase {artifact.status.phase.value}; must be Approved")
+        if gate is not None and gate.passed != derived_passed(gate):
             await self._emit(
                 ControlEventType.RELEASE_BLOCKED,
                 principal,
                 resource=artifact.resource_key(),
                 tenant=artifact.metadata.tenant,
-                details={"gate": gate.model_dump(mode="json")},
+                details={"reason": "inconsistent_gate", "gate_passed": gate.passed},
             )
-            raise GateFailedError("cannot Release without a passing Gate", decision=gate)
+            raise GateFailedError(
+                "inconsistent GateDecision: passed does not match non-skipped checks",
+                decision=gate,
+            )
+        try:
+            stored_gate = self._load_stored_gate(artifact, gate_id=gate_id)
+            assert_can_release(artifact.status.phase, stored_gate)
+        except (LifecycleError, GateFailedError) as exc:
+            decision = getattr(exc, "decision", None)
+            await self._emit(
+                ControlEventType.RELEASE_BLOCKED,
+                principal,
+                resource=artifact.resource_key(),
+                tenant=artifact.metadata.tenant,
+                details={
+                    "phase": artifact.status.phase.value,
+                    "gate_passed": bool(decision.passed) if decision is not None else False,
+                    "reason": str(exc),
+                },
+            )
+            raise
 
-        gate_id = new_id("gate")
-        self.store.put_gate(gate_id, gate)
-        artifact.status.lastGateResultId = gate_id
-        await self._emit(
-            ControlEventType.GATE_RECORDED,
-            principal,
-            resource=artifact.resource_key(),
-            tenant=artifact.metadata.tenant,
-            details={"gate_id": gate_id, "passed": gate.passed},
-        )
+        verified = verify_gate_decision(stored_gate)
+        if verified.experiment_run_id != artifact.status.lastExperimentRunId:
+            await self._emit(
+                ControlEventType.RELEASE_BLOCKED,
+                principal,
+                resource=artifact.resource_key(),
+                tenant=artifact.metadata.tenant,
+                details={
+                    "reason": "stale_gate",
+                    "gate_run": verified.experiment_run_id,
+                    "artifact_run": artifact.status.lastExperimentRunId,
+                },
+            )
+            raise GateFailedError(
+                "Gate decision is not for this artifact version's experiment run",
+                decision=verified,
+            )
 
         desired_weight = weight if weight is not None else (
             CANARY_WEIGHT if channel is ReleaseChannel.CANARY else FULL_WEIGHT
@@ -511,12 +607,29 @@ class ControlPlane:
         auto_rollback: bool = True,
         rollback_to: str | None = None,
     ) -> SLOSignal:
+        deployment = self.store.get_deployment(signal.deployment_id)
+        if deployment is None:
+            raise AssetNotFoundError(f"deployment not found: {signal.deployment_id}")
+        assert_same_tenant(
+            principal, deployment.tenant, action="record_slo", resource=signal.deployment_id
+        )
+        if auto_rollback and signal.breached:
+            current = self.store.get_artifact(
+                deployment.tenant, deployment.agent_name, deployment.agent_version
+            )
+            if current is not None:
+                assert_can_mutate(
+                    principal,
+                    current.metadata,
+                    action="record_slo",
+                    resource=current.resource_key(),
+                )
         stored = self.store.add_slo(signal)
         await self._emit(
             ControlEventType.SLO_RECORDED,
             principal,
             resource=signal.deployment_id,
-            tenant=principal.tenant,
+            tenant=deployment.tenant,
             details={
                 "metric": signal.metric,
                 "value": signal.value,
@@ -525,12 +638,6 @@ class ControlPlane:
             },
         )
         if auto_rollback and stored.breached:
-            deployment = self.store.get_deployment(signal.deployment_id)
-            if deployment is None:
-                return stored
-            assert_same_tenant(
-                principal, deployment.tenant, action="record_slo", resource=signal.deployment_id
-            )
             previous = rollback_to or self._previous_released_version(
                 tenant=deployment.tenant, name=deployment.agent_name, current=deployment.agent_version
             )
@@ -546,14 +653,25 @@ class ControlPlane:
                 )
         return stored
 
-    def lineage(self, ref: AssetRef, *, tenant: str) -> dict[str, list[AssetRef]]:
-        key = ref.key(tenant)
+    def lineage(
+        self, ref: AssetRef, principal: Principal, *, tenant: str | None = None
+    ) -> dict[str, list[AssetRef]]:
+        tenant_id = tenant or principal.tenant or ref.tenant or ""
+        assert_same_tenant(principal, tenant_id, action="read", resource=ref.display())
+        record = self.store.get_asset(ref.kind, tenant_id, ref.name, ref.version)
+        if record is not None:
+            assert_can_read(principal, record.metadata, resource=ref.display())
+        key = ref.key(tenant_id)
         outgoing = [e.target for e in self.store.list_edges(source=key)]
         incoming = [e.source for e in self.store.list_edges(target=key)]
         return {"uses": outgoing, "used_by": incoming}
 
-    def events_for(self, resource: str, *, tenant: str | None = None) -> list[ControlEvent]:
-        return self.store.list_events(tenant=tenant, resource=resource)
+    def events_for(
+        self, resource: str, principal: Principal, *, tenant: str | None = None
+    ) -> list[ControlEvent]:
+        tenant_id = tenant or principal.tenant
+        assert_same_tenant(principal, tenant_id, action="read", resource=resource)
+        return self.store.list_events(tenant=tenant_id, resource=resource)
 
     async def _require_mutable(
         self, name: str, version: str, principal: Principal, *, action: str
@@ -670,8 +788,32 @@ class ControlPlane:
             ]
             if not artifacts:
                 return None
+            artifacts.sort(key=lambda a: Version(a.version))
             return artifacts[-1].version
         return deployments[-1].agent_version
+
+    def _load_stored_gate(self, artifact: AgentArtifact, *, gate_id: str | None) -> GateDecision:
+        resolved_id = gate_id or artifact.status.lastGateResultId
+        if not resolved_id:
+            raise GateFailedError("cannot Release without a stored Gate decision")
+        stored = self.store.get_gate(resolved_id)
+        if stored is None:
+            raise GateFailedError(f"stored Gate decision not found: {resolved_id}")
+        return stored
+
+    def _is_experiment_pinned(self, record: AssetRecord) -> bool:
+        ref = record.ref()
+        return any(
+            edge.relation == "evaluates"
+            for edge in self.store.list_edges(target=ref.key(record.tenant))
+        )
+
+    def mark_immutable(self, kind: AssetKind, tenant: str, name: str, version: str) -> AssetRecord | None:
+        record = self.store.get_asset(kind, tenant, name, version)
+        if record is None:
+            return None
+        stored = self.store.put_asset(record.model_copy(update={"immutable": True}))
+        return stored
 
     async def _emit(
         self,

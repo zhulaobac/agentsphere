@@ -99,14 +99,14 @@ async def test_uniform_asset_kinds_stubs_and_lineage(principal: Principal) -> No
     stored = await cp.put_artifact(artifact, principal)
     graph = cp.lineage(
         AssetRef(kind=AssetKind.AGENT, name="wired", version="0.1.0", tenant=principal.tenant),
-        tenant=principal.tenant,
+        principal,
     )
     used = {ref.display() for ref in graph["uses"]}
     assert "Prompt/prompt@1.0.0" in used
     assert "Tool/tool@1.0.0" in used
     assert "Policy/policy@1.0.0" in used
     assert "MemoryStore/memorystore@1.0.0" in used
-    events = cp.events_for(stored.resource_key(), tenant=principal.tenant)
+    events = cp.events_for(stored.resource_key(), principal)
     assert any(e.type.value == "lineage.edge" for e in events)
 
 

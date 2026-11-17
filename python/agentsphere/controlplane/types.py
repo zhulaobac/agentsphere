@@ -121,6 +121,12 @@ class GateDecision(BaseModel):
     def failed_checks(self) -> list[GateCheck]:
         return [c for c in self.checks if not c.skipped and not c.passed]
 
+    def derived_passed(self) -> bool:
+        material = [c for c in self.checks if not c.skipped]
+        if not material:
+            return False
+        return all(c.passed for c in material)
+
 
 class SLOSignal(BaseModel):
     """Recorded (not live-scraped) SLO/gate signal that may trigger auto-rollback."""

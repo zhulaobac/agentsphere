@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from agentsphere.controlplane import AgentArtifact, AgentSpec, AssetMetadata, ControlPlane, Principal
+import pytest
+
+from agentsphere.controlplane import (
+    AgentArtifact,
+    AgentSpec,
+    AssetKind,
+    AssetMetadata,
+    ControlPlane,
+    ImmutableAssetError,
+    Principal,
+)
 from agentsphere.evaluation import (
     ArtifactRuntimeFactory,
     DatasetCase,
@@ -216,3 +226,50 @@ async def test_cost_and_latency_metrics_flow_into_summary(principal: Principal) 
     run = await runner.run(spec, principal)
     assert run.summary.mean_cost == 3.5
     assert run.summary.mean_latency_ms == 12.0
+
+
+async def test_put_asset_cannot_mutate_pinned_dataset(principal: Principal) -> None:
+    control = ControlPlane()
+    await _agent(control, principal)
+    datasets = DatasetService(control)
+    original = [
+        DatasetCase(case_id="ok", input="a", expected="yes"),
+    ]
+    await datasets.create(name="ds", version="1.0.0", principal=principal, cases=original)
+    evaluators = EvaluatorRegistry()
+    evaluators.register(RuleAssertionEvaluator())
+    runner = ExperimentRunner(
+        control,
+        evaluators,
+        datasets=datasets,
+        executor=ScriptedExecutor({"ok": "yes"}),
+    )
+    spec = ExperimentSpec(
+        agent_name="eval-bot",
+        agent_version="0.1.0",
+        dataset_name="ds",
+        dataset_version="1.0.0",
+        evaluator_name="rule-assertion",
+        evaluator_version="0.1.0",
+    )
+    first = await runner.run(spec, principal)
+    assert first.summary.pass_rate == 1.0
+    fingerprint = first.summary.fingerprint
+    content_hash = first.dataset_content_hash
+    with pytest.raises(ImmutableAssetError):
+        await control.put_asset(
+            kind=AssetKind.DATASET,
+            metadata=AssetMetadata(name="ds", owner=principal.owner, tenant=principal.tenant),
+            version="1.0.0",
+            spec={
+                "cases": [DatasetCase(case_id="ok", input="a", expected="changed").model_dump(mode="json")],
+            },
+            principal=principal,
+            replace=True,
+        )
+    second = await runner.run(spec, principal)
+    assert second.summary.fingerprint == fingerprint
+    assert second.dataset_content_hash == content_hash
+    assert second.summary.pass_rate == 1.0
+    loaded = await datasets.get("ds", "1.0.0", principal)
+    assert loaded.cases[0].expected == "yes"

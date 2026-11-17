@@ -36,7 +36,6 @@ class ReleasePipeline:
         mark_lifecycle: bool = True,
     ) -> tuple[ExperimentRun, GateDecision]:
         run = await self.experiments.run(spec, principal)
-        decision = self.gate.evaluate(run, thresholds=thresholds, baseline=baseline)
         if mark_lifecycle:
             artifact = await self.control.get_artifact(spec.agent_name, spec.agent_version, principal)
             if artifact.status.phase.value == "Built":
@@ -46,6 +45,14 @@ class ReleasePipeline:
                     principal,
                     experiment_run_id=run.run_id,
                 )
+        _, decision = await self.control.record_gate(
+            spec.agent_name,
+            spec.agent_version,
+            principal,
+            experiment_run_id=run.run_id,
+            thresholds=thresholds,
+            baseline_run_id=baseline.run_id if baseline is not None else None,
+        )
         return run, decision
 
     async def release_if_passing(

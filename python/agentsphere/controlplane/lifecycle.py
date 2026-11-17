@@ -5,7 +5,8 @@ Each transition is event-driven. Preconditions fail closed (e.g. no Release with
 
 from __future__ import annotations
 
-from agentsphere.controlplane.errors import LifecycleError
+from agentsphere.controlplane.errors import GateFailedError, LifecycleError
+from agentsphere.controlplane.gate import derived_passed
 from agentsphere.controlplane.types import GateDecision, LifecyclePhase
 
 ALLOWED_TRANSITIONS: frozenset[tuple[LifecyclePhase, LifecyclePhase]] = frozenset(
@@ -31,6 +32,11 @@ def assert_can_release(phase: LifecyclePhase, gate: GateDecision | None) -> None
     if phase is not LifecyclePhase.APPROVED:
         raise LifecycleError(f"cannot Release from phase {phase.value}; must be Approved")
     if gate is None:
-        raise LifecycleError("cannot Release without a Gate decision")
-    if not gate.passed:
-        raise LifecycleError("cannot Release without a passing Gate")
+        raise GateFailedError("cannot Release without a Gate decision")
+    if gate.passed != derived_passed(gate):
+        raise GateFailedError(
+            "inconsistent GateDecision: passed does not match non-skipped checks",
+            decision=gate,
+        )
+    if not derived_passed(gate):
+        raise GateFailedError("cannot Release without a passing Gate", decision=gate)

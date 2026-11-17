@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from agentsphere.controlplane import (
     AgentArtifact,
     AgentSpec,
@@ -7,9 +9,9 @@ from agentsphere.controlplane import (
     AssetMetadata,
     AssetNotFoundError,
     AssetRef,
+    AuthorizationError,
     ControlPlane,
     DeploymentStatus,
-    GateDecision,
     LifecyclePhase,
     ManagedRuntimeProvider,
     Principal,
@@ -18,6 +20,7 @@ from agentsphere.controlplane import (
 )
 from agentsphere.model_adapter import MockModelProvider, ModelAdapter, assistant_text
 from agentsphere.runtime import InMemoryEventStore, build_runtime
+from tests.experiment_stubs import stub_experiment_run
 
 
 async def _ship(cp: ControlPlane, principal: Principal, *, version: str) -> None:
@@ -40,9 +43,12 @@ async def _ship(cp: ControlPlane, principal: Principal, *, version: str) -> None
         principal,
     )
     await cp.build("bot", version, principal)
-    await cp.record_evaluation("bot", version, principal, experiment_run_id=f"exp-{version}")
+    run_id = f"exp-{version}"
+    cp.register_experiment(stub_experiment_run(run_id, "bot", version))
+    await cp.record_evaluation("bot", version, principal, experiment_run_id=run_id)
     await cp.approve("bot", version, principal)
-    await cp.release("bot", version, principal, GateDecision(passed=True, reason="ok"))
+    await cp.record_gate("bot", version, principal, experiment_run_id=run_id)
+    await cp.release("bot", version, principal)
 
 
 async def test_canary_then_full_then_rollback(principal: Principal) -> None:
@@ -114,3 +120,56 @@ async def test_managed_runtime_provider_binds_release(principal: Principal, regi
     assert events
     stored = await provider.list_events(session.session_id)
     assert stored[0].session_id == session.session_id
+
+
+async def test_foreign_principal_cannot_insert_slo(
+    principal: Principal, other_tenant: Principal
+) -> None:
+    cp = ControlPlane()
+    await _ship(cp, principal, version="1.0.0")
+    deployments = cp.store.list_deployments(tenant=principal.tenant, name="bot")
+    deployment_id = deployments[-1].deployment_id
+    before = cp.store.list_slo(deployment_id=deployment_id)
+    before_events = len(cp.store.list_events(tenant=principal.tenant))
+    signal = SLOSignal(
+        deployment_id=deployment_id,
+        metric="success_rate",
+        value=0.1,
+        threshold=0.9,
+        direction="below_is_bad",
+    )
+    with pytest.raises(AuthorizationError):
+        await cp.record_slo(signal, other_tenant, auto_rollback=True)
+    with pytest.raises(AuthorizationError):
+        await cp.record_slo(signal, other_tenant, auto_rollback=False)
+    assert cp.store.list_slo(deployment_id=deployment_id) == before
+    assert len(cp.store.list_events(tenant=principal.tenant)) == before_events
+    still = await cp.get_artifact("bot", "1.0.0", principal)
+    assert still.status.phase is LifecyclePhase.RELEASED
+
+
+async def test_auto_rollback_semver_fallback_restores_1_10_0(principal: Principal) -> None:
+    cp = ControlPlane()
+    for version in ("1.2.0", "1.10.0", "1.11.0"):
+        await _ship(cp, principal, version=version)
+    previous = cp._previous_released_version(tenant=principal.tenant, name="bot", current="1.11.0")
+    assert previous == "1.10.0"
+    deployments = [
+        d
+        for d in cp.store.list_deployments(tenant=principal.tenant, name="bot")
+        if d.agent_version == "1.11.0" and d.status is DeploymentStatus.ACTIVE
+    ]
+    await cp.record_slo(
+        SLOSignal(
+            deployment_id=deployments[-1].deployment_id,
+            metric="success_rate",
+            value=0.2,
+            threshold=0.9,
+            direction="below_is_bad",
+        ),
+        principal,
+    )
+    restored = await cp.get_artifact("bot", "1.10.0", principal)
+    assert restored.status.phase is LifecyclePhase.RELEASED
+    current = await cp.get_artifact("bot", "1.11.0", principal)
+    assert current.status.phase is LifecyclePhase.DEPRECATED

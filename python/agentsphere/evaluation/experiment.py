@@ -85,6 +85,7 @@ class ExperimentRun(BaseModel):
     cases: list[CaseRun] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     agent_fingerprint: str | None = None
+    dataset_content_hash: str | None = None
 
 
 Executor = Callable[[AgentArtifact, DatasetCase, int], Awaitable[tuple[str, list[Event], SampleMetrics, str | None]]]
@@ -280,8 +281,10 @@ class ExperimentRunner:
             summary=summary,
             cases=cases,
             agent_fingerprint=_artifact_fingerprint(artifact),
+            dataset_content_hash=_dataset_content_hash(dataset),
         )
         stored = self.store.put(run)
+        self.control.register_experiment(stored)
         self._pin_dataset(artifact, dataset, principal)
         return stored
 
@@ -301,6 +304,7 @@ class ExperimentRunner:
         self.control.store.add_edge(
             DependencyEdge(source=source, target=target, relation="evaluates", actor=principal.name)
         )
+        self.control.mark_immutable(AssetKind.DATASET, dataset.tenant, dataset.name, dataset.version)
 
 
 def summarize(cases: list[CaseRun], *, samples_k: int, fingerprint: str) -> ExperimentSummary:
@@ -347,6 +351,12 @@ def summarize(cases: list[CaseRun], *, samples_k: int, fingerprint: str) -> Expe
 
 def _artifact_fingerprint(artifact: AgentArtifact) -> str:
     payload = artifact.spec.model_dump(mode="json")
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _dataset_content_hash(dataset: DatasetVersion) -> str:
+    payload = [case.model_dump(mode="json") for case in dataset.cases]
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
