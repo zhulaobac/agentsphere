@@ -15,7 +15,14 @@ from agentsphere.controlplane import (
     LifecyclePhase,
     Principal,
 )
-from agentsphere.evaluation.experiment import ExperimentRun
+from agentsphere.evaluation.experiment import (
+    CaseRun,
+    ExperimentRun,
+    ExperimentSpec,
+    ExperimentSummary,
+    SampleRecord,
+)
+from agentsphere.evaluation.types import DatasetCase, EvalResult
 from tests.experiment_stubs import ready_draft, stub_experiment_run
 
 
@@ -242,6 +249,107 @@ async def test_foreign_principal_cannot_use_experiment_run(
         await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-agent")
     with pytest.raises((AuthorizationError, LifecycleError)):
         await cp.record_gate("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-agent")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.release("bot", "0.1.0", other_tenant)
+
+    two_cases = ExperimentRun(
+        run_id="exp-two-cases",
+        spec=ExperimentSpec(
+            agent_name="bot",
+            agent_version="0.1.0",
+            dataset_name="stub-ds",
+            dataset_version="1.0.0",
+            evaluator_name="rule-assertion",
+            evaluator_version="0.1.0",
+            tenant=principal.tenant,
+        ),
+        summary=ExperimentSummary(
+            n_cases=2, n_samples=1, pass_rate=1.0, pass_at_k=1.0, variance=0.0, fingerprint="stub"
+        ),
+        cases=[
+            CaseRun(
+                case=DatasetCase(case_id="c1", input="a", expected="ok"),
+                samples=[
+                    SampleRecord(
+                        sample_index=0,
+                        output="ok",
+                        passed=True,
+                        result=EvalResult(passed=True, score=1.0),
+                    )
+                ],
+            ),
+            CaseRun(
+                case=DatasetCase(case_id="c2", input="b", expected="yes"),
+                samples=[
+                    SampleRecord(
+                        sample_index=0,
+                        output="yes",
+                        passed=True,
+                        result=EvalResult(passed=True, score=1.0),
+                    )
+                ],
+            ),
+        ],
+    )
+    cp.register_experiment(two_cases)
+    cases_data = two_cases.model_dump()
+    cases_data["run_id"] = "exp-stolen-cases"
+    cases_data["spec"]["tenant"] = other_tenant.tenant
+    cases_data["cases"] = list(reversed(cases_data["cases"]))
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(ExperimentRun.model_validate(cases_data), other_tenant)
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-cases")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_gate("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-cases")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.release("bot", "0.1.0", other_tenant)
+
+    two_samples = ExperimentRun(
+        run_id="exp-two-samples",
+        spec=ExperimentSpec(
+            agent_name="bot",
+            agent_version="0.1.0",
+            dataset_name="stub-ds",
+            dataset_version="1.0.0",
+            evaluator_name="rule-assertion",
+            evaluator_version="0.1.0",
+            tenant=principal.tenant,
+        ),
+        summary=ExperimentSummary(
+            n_cases=1, n_samples=2, pass_rate=1.0, pass_at_k=1.0, variance=0.0, fingerprint="stub"
+        ),
+        cases=[
+            CaseRun(
+                case=DatasetCase(case_id="c1", input="a", expected="ok"),
+                samples=[
+                    SampleRecord(
+                        sample_index=0,
+                        output="ok",
+                        passed=True,
+                        result=EvalResult(passed=True, score=1.0),
+                    ),
+                    SampleRecord(
+                        sample_index=1,
+                        output="okay",
+                        passed=True,
+                        result=EvalResult(passed=True, score=0.9),
+                    ),
+                ],
+            )
+        ],
+    )
+    cp.register_experiment(two_samples)
+    samples_data = two_samples.model_dump()
+    samples_data["run_id"] = "exp-stolen-samples"
+    samples_data["spec"]["tenant"] = other_tenant.tenant
+    samples_data["cases"][0]["samples"] = list(reversed(samples_data["cases"][0]["samples"]))
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(ExperimentRun.model_validate(samples_data), other_tenant)
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-samples")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_gate("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-samples")
     with pytest.raises((AuthorizationError, LifecycleError)):
         await cp.release("bot", "0.1.0", other_tenant)
 

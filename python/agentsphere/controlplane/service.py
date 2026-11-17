@@ -89,6 +89,18 @@ def _experiment_evidence_key(run: Any) -> str:
                     "result_passed": getattr(result, "passed", None) if result is not None else None,
                 }
             )
+        samples.sort(
+            key=lambda item: json.dumps(
+                {
+                    "output": item.get("output"),
+                    "passed": item.get("passed"),
+                    "score": item.get("score"),
+                    "result_passed": item.get("result_passed"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
         cases.append(
             {
                 "input": getattr(case, "input", None) if case is not None else None,
@@ -97,6 +109,17 @@ def _experiment_evidence_key(run: Any) -> str:
                 "samples": samples,
             }
         )
+    cases.sort(
+        key=lambda item: json.dumps(
+            {
+                "input": item.get("input"),
+                "expected": item.get("expected"),
+                "labels": item.get("labels"),
+            },
+            sort_keys=True,
+            default=str,
+        )
+    )
     payload = {
         "agent_name": getattr(spec, "agent_name", None),
         "agent_version": getattr(spec, "agent_version", None),
