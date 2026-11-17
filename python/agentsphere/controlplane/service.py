@@ -109,17 +109,7 @@ def _experiment_evidence_key(run: Any) -> str:
                 "samples": samples,
             }
         )
-    cases.sort(
-        key=lambda item: json.dumps(
-            {
-                "input": item.get("input"),
-                "expected": item.get("expected"),
-                "labels": item.get("labels"),
-            },
-            sort_keys=True,
-            default=str,
-        )
-    )
+    cases.sort(key=lambda item: json.dumps(item, sort_keys=True, default=str))
     payload = {
         "agent_name": getattr(spec, "agent_name", None),
         "agent_version": getattr(spec, "agent_version", None),

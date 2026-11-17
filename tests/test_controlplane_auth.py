@@ -353,6 +353,121 @@ async def test_foreign_principal_cannot_use_experiment_run(
     with pytest.raises((AuthorizationError, LifecycleError)):
         await cp.release("bot", "0.1.0", other_tenant)
 
+    same_key_spec = ExperimentSpec(
+        agent_name="bot",
+        agent_version="0.1.0",
+        dataset_name="stub-ds",
+        dataset_version="1.0.0",
+        evaluator_name="rule-assertion",
+        evaluator_version="0.1.0",
+        tenant=principal.tenant,
+    )
+    same_key_cases = ExperimentRun(
+        run_id="exp-same-key-cases",
+        spec=same_key_spec,
+        summary=ExperimentSummary(
+            n_cases=2, n_samples=1, pass_rate=1.0, pass_at_k=1.0, variance=0.0, fingerprint="stub"
+        ),
+        cases=[
+            CaseRun(
+                case=DatasetCase(case_id="c1", input="hello", expected="ok"),
+                samples=[
+                    SampleRecord(
+                        sample_index=0,
+                        output="yes",
+                        passed=True,
+                        result=EvalResult(passed=True, score=1.0),
+                    )
+                ],
+            ),
+            CaseRun(
+                case=DatasetCase(case_id="c2", input="hello", expected="ok"),
+                samples=[
+                    SampleRecord(
+                        sample_index=0,
+                        output="no",
+                        passed=True,
+                        result=EvalResult(passed=True, score=0.5),
+                    )
+                ],
+            ),
+        ],
+    )
+    cp.register_experiment(same_key_cases)
+    same_key_data = same_key_cases.model_dump()
+    same_key_data["run_id"] = "exp-stolen-same-key"
+    same_key_data["spec"]["tenant"] = other_tenant.tenant
+    same_key_data["cases"] = list(reversed(same_key_data["cases"]))
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(ExperimentRun.model_validate(same_key_data), other_tenant)
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-same-key")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_gate("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-same-key")
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.release("bot", "0.1.0", other_tenant)
+
+    nested_samples = ExperimentRun(
+        run_id="exp-same-key-nested",
+        spec=same_key_spec.model_copy(),
+        summary=ExperimentSummary(
+            n_cases=2, n_samples=2, pass_rate=1.0, pass_at_k=1.0, variance=0.0, fingerprint="stub"
+        ),
+        cases=[
+            CaseRun(
+                case=DatasetCase(case_id="p1", input="hello", expected="ok"),
+                samples=[
+                    SampleRecord(
+                        sample_index=0,
+                        output="a1",
+                        passed=True,
+                        result=EvalResult(passed=True, score=1.0),
+                    ),
+                    SampleRecord(
+                        sample_index=1,
+                        output="a2",
+                        passed=True,
+                        result=EvalResult(passed=True, score=0.9),
+                    ),
+                ],
+            ),
+            CaseRun(
+                case=DatasetCase(case_id="p2", input="hello", expected="ok"),
+                samples=[
+                    SampleRecord(
+                        sample_index=0,
+                        output="b1",
+                        passed=True,
+                        result=EvalResult(passed=True, score=0.8),
+                    ),
+                    SampleRecord(
+                        sample_index=1,
+                        output="b2",
+                        passed=True,
+                        result=EvalResult(passed=True, score=0.7),
+                    ),
+                ],
+            ),
+        ],
+    )
+    cp.register_experiment(nested_samples)
+    nested_data = nested_samples.model_dump()
+    nested_data["run_id"] = "exp-stolen-same-key-nested"
+    nested_data["spec"]["tenant"] = other_tenant.tenant
+    nested_data["cases"] = list(reversed(nested_data["cases"]))
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(ExperimentRun.model_validate(nested_data), other_tenant)
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_evaluation(
+            "bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-same-key-nested"
+        )
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_gate(
+            "bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-same-key-nested"
+        )
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.release("bot", "0.1.0", other_tenant)
+
     cp.register_experiment(
         stub_experiment_run(
             "bob-run",
