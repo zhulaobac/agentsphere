@@ -252,6 +252,69 @@ async def test_foreign_principal_cannot_use_experiment_run(
     with pytest.raises((AuthorizationError, LifecycleError)):
         await cp.release("bot", "0.1.0", other_tenant)
 
+    for stolen_id, field, value in (
+        ("exp-stolen-ds-name", "dataset_name", "bob-ds"),
+        ("exp-stolen-ds-ver", "dataset_version", "9.9.9"),
+        ("exp-stolen-eval-name", "evaluator_name", "other-eval"),
+        ("exp-stolen-eval-ver", "evaluator_version", "9.9.9"),
+    ):
+        ident_data = alice_run.model_dump()
+        ident_data["run_id"] = stolen_id
+        ident_data["spec"]["tenant"] = other_tenant.tenant
+        ident_data["spec"][field] = value
+        with pytest.raises(AuthorizationError):
+            cp.register_experiment(ExperimentRun.model_validate(ident_data), other_tenant)
+        with pytest.raises((AuthorizationError, LifecycleError)):
+            await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id=stolen_id)
+        with pytest.raises((AuthorizationError, LifecycleError)):
+            await cp.record_gate("bot", "0.1.0", other_tenant, experiment_run_id=stolen_id)
+        with pytest.raises((AuthorizationError, LifecycleError)):
+            await cp.release("bot", "0.1.0", other_tenant)
+    assert cp.store.list_deployments(tenant=other_tenant.tenant, name="bot") == []
+
+    numeric_expected = ExperimentRun(
+        run_id="exp-numeric-expected",
+        spec=ExperimentSpec(
+            agent_name="bot",
+            agent_version="0.1.0",
+            dataset_name="stub-ds",
+            dataset_version="1.0.0",
+            evaluator_name="rule-assertion",
+            evaluator_version="0.1.0",
+            tenant=principal.tenant,
+        ),
+        summary=ExperimentSummary(
+            n_cases=1, n_samples=1, pass_rate=1.0, pass_at_k=1.0, variance=0.0, fingerprint="stub"
+        ),
+        cases=[
+            CaseRun(
+                case=DatasetCase(case_id="n1", input="n", expected=1.0),
+                samples=[
+                    SampleRecord(
+                        sample_index=0,
+                        output="1.0",
+                        passed=True,
+                        result=EvalResult(passed=True, score=1.0),
+                    )
+                ],
+            )
+        ],
+    )
+    cp.register_experiment(numeric_expected)
+    int_expected = numeric_expected.model_dump()
+    int_expected["run_id"] = "exp-stolen-expected-int"
+    int_expected["spec"]["tenant"] = other_tenant.tenant
+    int_expected["cases"][0]["case"]["expected"] = 1
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(ExperimentRun.model_validate(int_expected), other_tenant)
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_evaluation(
+            "bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen-expected-int"
+        )
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.release("bot", "0.1.0", other_tenant)
+    assert cp.store.list_deployments(tenant=other_tenant.tenant, name="bot") == []
+
     two_cases = ExperimentRun(
         run_id="exp-two-cases",
         spec=ExperimentSpec(

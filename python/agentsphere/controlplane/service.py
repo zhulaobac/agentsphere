@@ -72,6 +72,22 @@ def _snapshot_experiment_run(run: Any) -> Any:
     return copied
 
 
+def _canonicalize_origin_value(value: Any) -> Any:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _canonicalize_origin_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_origin_value(item) for item in value]
+    return value
+
+
+def _origin_dump(value: Any) -> str:
+    return json.dumps(_canonicalize_origin_value(value), sort_keys=True, default=str)
+
+
 def _experiment_evidence_key(run: Any) -> str:
     spec = getattr(run, "spec", None)
     summary = getattr(run, "summary", None)
@@ -82,47 +98,37 @@ def _experiment_evidence_key(run: Any) -> str:
         for sample in getattr(case_run, "samples", None) or []:
             result = getattr(sample, "result", None)
             samples.append(
+                _canonicalize_origin_value(
+                    {
+                        "output": getattr(sample, "output", ""),
+                        "passed": getattr(sample, "passed", False),
+                        "score": getattr(result, "score", None) if result is not None else None,
+                        "result_passed": getattr(result, "passed", None) if result is not None else None,
+                    }
+                )
+            )
+        samples.sort(key=_origin_dump)
+        cases.append(
+            _canonicalize_origin_value(
                 {
-                    "output": getattr(sample, "output", ""),
-                    "passed": getattr(sample, "passed", False),
-                    "score": getattr(result, "score", None) if result is not None else None,
-                    "result_passed": getattr(result, "passed", None) if result is not None else None,
+                    "input": getattr(case, "input", None) if case is not None else None,
+                    "expected": getattr(case, "expected", None) if case is not None else None,
+                    "labels": getattr(case, "labels", None) if case is not None else None,
+                    "samples": samples,
                 }
             )
-        samples.sort(
-            key=lambda item: json.dumps(
-                {
-                    "output": item.get("output"),
-                    "passed": item.get("passed"),
-                    "score": item.get("score"),
-                    "result_passed": item.get("result_passed"),
-                },
-                sort_keys=True,
-                default=str,
-            )
         )
-        cases.append(
-            {
-                "input": getattr(case, "input", None) if case is not None else None,
-                "expected": getattr(case, "expected", None) if case is not None else None,
-                "labels": getattr(case, "labels", None) if case is not None else None,
-                "samples": samples,
-            }
-        )
-    cases.sort(key=lambda item: json.dumps(item, sort_keys=True, default=str))
-    payload = {
-        "agent_name": getattr(spec, "agent_name", None),
-        "agent_version": getattr(spec, "agent_version", None),
-        "dataset_name": getattr(spec, "dataset_name", None),
-        "dataset_version": getattr(spec, "dataset_version", None),
-        "evaluator_name": getattr(spec, "evaluator_name", None),
-        "evaluator_version": getattr(spec, "evaluator_version", None),
-        "pass_rate": getattr(summary, "pass_rate", None),
-        "pass_at_k": getattr(summary, "pass_at_k", None),
-        "cases": cases,
-    }
-    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    cases.sort(key=_origin_dump)
+    payload = _canonicalize_origin_value(
+        {
+            "agent_name": getattr(spec, "agent_name", None),
+            "agent_version": getattr(spec, "agent_version", None),
+            "pass_rate": getattr(summary, "pass_rate", None),
+            "pass_at_k": getattr(summary, "pass_at_k", None),
+            "cases": cases,
+        }
+    )
+    return hashlib.sha256(_origin_dump(payload).encode("utf-8")).hexdigest()
 
 
 class ControlPlane:
