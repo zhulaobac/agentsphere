@@ -345,6 +345,17 @@ class ControlPlane:
             raise
 
         verified = verify_gate_decision(stored_gate)
+        if channel is not ReleaseChannel.CANARY:
+            await self._emit(
+                ControlEventType.RELEASE_BLOCKED,
+                principal,
+                resource=artifact.resource_key(),
+                tenant=artifact.metadata.tenant,
+                details={"reason": "canary_required", "channel": channel.value},
+            )
+            raise LifecycleError(
+                "cannot Release to Full; promote an active Canary instead"
+            )
         if verified.experiment_run_id != artifact.status.lastExperimentRunId:
             await self._emit(
                 ControlEventType.RELEASE_BLOCKED,

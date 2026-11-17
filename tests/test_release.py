@@ -12,6 +12,7 @@ from agentsphere.controlplane import (
     AuthorizationError,
     ControlPlane,
     DeploymentStatus,
+    LifecycleError,
     LifecyclePhase,
     ManagedRuntimeProvider,
     Principal,
@@ -49,6 +50,45 @@ async def _ship(cp: ControlPlane, principal: Principal, *, version: str) -> None
     await cp.approve("bot", version, principal)
     await cp.record_gate("bot", version, principal, experiment_run_id=run_id)
     await cp.release("bot", version, principal)
+
+
+async def test_release_to_full_without_canary_is_rejected(principal: Principal) -> None:
+    cp = ControlPlane()
+    try:
+        await cp.get_asset(AssetKind.PROMPT, "sys", "1.0.0", principal)
+    except AssetNotFoundError:
+        await cp.put_asset(
+            kind=AssetKind.PROMPT,
+            metadata=AssetMetadata(name="sys", owner=principal.owner, tenant=principal.tenant),
+            version="1.0.0",
+            spec={"text": "You are a bot."},
+            principal=principal,
+        )
+    await cp.put_artifact(
+        AgentArtifact(
+            metadata=AssetMetadata(name="bot", owner=principal.owner, tenant=principal.tenant),
+            spec=AgentSpec(prompts=[AssetRef(kind=AssetKind.PROMPT, name="sys", version="1.0.0")]),
+            version="0.1.0",
+        ),
+        principal,
+    )
+    await cp.build("bot", "0.1.0", principal)
+    cp.register_experiment(stub_experiment_run("exp-full", "bot", "0.1.0"))
+    await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp-full")
+    await cp.approve("bot", "0.1.0", principal)
+    await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-full")
+    with pytest.raises(LifecycleError, match="promote an active Canary"):
+        await cp.release("bot", "0.1.0", principal, channel=ReleaseChannel.FULL)
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.APPROVED
+    assert still.status.deployedVersions == []
+    canary, dep = await cp.release("bot", "0.1.0", principal)
+    assert canary.status.phase is LifecyclePhase.RELEASED
+    assert dep.channel is ReleaseChannel.CANARY
+    promoted, full = await cp.promote("bot", "0.1.0", principal)
+    assert promoted.status.releaseChannel is ReleaseChannel.FULL
+    assert full.channel is ReleaseChannel.FULL
+    assert full.weight == 1.0
 
 
 async def test_canary_then_full_then_rollback(principal: Principal) -> None:
