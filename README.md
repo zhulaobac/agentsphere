@@ -127,10 +127,13 @@ provider = resolve_model_provider(
 adapter = ModelAdapter(provider)
 ```
 
-A missing key, empty key, missing base URL/model, or a live provider without an
-injected transport / `allow_network=True` **fails closed**. Do not commit keys,
-`.env` files, or sample tokens that look real. `StdlibHttpTransport` refuses
-non-loopback hosts unless `allow_public_network=True`.
+A missing key, empty or whitespace-only key, missing base URL/model, or a live
+provider without an injected transport / `allow_network=True` **fails closed**.
+Do not commit keys, `.env` files, or sample tokens that look real. Base URLs
+must not include userinfo or secret query parameters (`api_key`, `access_token`,
+`authorization`, …). `StdlibHttpTransport` refuses non-loopback hosts unless
+`allow_public_network=True`, does not follow HTTP redirects, and does not honor
+`HTTP_PROXY` / `HTTPS_PROXY` in loopback-only mode.
 
 ### Sandbox backend notes (ubuntu-latest)
 

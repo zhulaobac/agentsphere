@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -188,7 +188,7 @@ class ScriptedHttpTransport:
             parsed = {"_raw": body.decode("utf-8", errors="replace")}
         self.calls.append(
             RecordedHttpCall(
-                url=url,
+                url=_public_url(url),
                 headers=_public_headers(headers),
                 body=parsed,
                 stream=stream,
@@ -214,12 +214,28 @@ class ScriptedHttpTransport:
         return item
 
 
-class StdlibHttpTransport:
-    """stdlib ``urllib`` transport. Loopback only unless ``allow_public_network``."""
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow 30x. urllib would otherwise copy Authorization to the next hop."""
 
-    def __init__(self, *, allow_public_network: bool = False, honor_proxy: bool = True) -> None:
+    def http_error_302(self, req, fp, code, msg, headers):  # noqa: ANN001
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+class StdlibHttpTransport:
+    """stdlib ``urllib`` transport. Loopback only unless ``allow_public_network``.
+
+    Redirects are never followed. Loopback-only mode never honors HTTP(S)_PROXY
+    (that would send the vault bearer to the proxy). Live
+    ``allow_public_network=True`` may honor a proxy when ``honor_proxy=True``.
+    """
+
+    def __init__(self, *, allow_public_network: bool = False, honor_proxy: bool | None = None) -> None:
         self.allow_public_network = allow_public_network
-        self.honor_proxy = honor_proxy
+        requested = False if honor_proxy is None else bool(honor_proxy)
+        # Loopback-only must not send the bearer to a process-level proxy.
+        self.honor_proxy = requested and allow_public_network
 
     async def post(
         self,
@@ -243,6 +259,10 @@ class StdlibHttpTransport:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             raise OpenAICompatNotConfigured("OpenAI-compatible URL must be http or https")
+        if parsed.username is not None or parsed.password is not None or "@" in (parsed.netloc or ""):
+            raise OpenAICompatNotConfigured("URL must not include userinfo")
+        if not parsed.hostname:
+            raise OpenAICompatNotConfigured("URL is missing a host")
         if self.allow_public_network:
             return
         if not _is_loopback_host(parsed.hostname):
@@ -251,9 +271,10 @@ class StdlibHttpTransport:
             )
 
     def _opener(self) -> urllib.request.OpenerDirector:
-        if self.honor_proxy:
-            return urllib.request.build_opener()
-        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        handlers: list[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+        if not self.honor_proxy:
+            handlers.insert(0, urllib.request.ProxyHandler({}))
+        return urllib.request.build_opener(*handlers)
 
     def _request(self, url: str, headers: dict[str, str], body: bytes) -> urllib.request.Request:
         request = urllib.request.Request(url, data=body, method="POST")
@@ -369,34 +390,50 @@ class OpenAICompatibleProvider:
 
     def __repr__(self) -> str:
         return (
-            f"OpenAICompatibleProvider(name={self.name!r}, base_url={self._config.base_url!r}, "
+            f"OpenAICompatibleProvider(name={self.name!r}, "
+            f"base_url={_public_url(self._config.base_url)!r}, "
             f"model={self._config.model!r}, secret_name={self._config.secret_name!r})"
         )
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         body = encode_chat_request(request, self._config, stream=False)
-        response = await self._send(body, stream=False)
-        return decode_chat_response(response, provider=self.name)
+        secret: str | None = None
+        try:
+            secret = await self._reveal_secret()
+            response = await self._exchange(body, secret, stream=False)
+            return decode_chat_response(response, provider=self.name, secret=secret)
+        except OpenAICompatError as exc:
+            raise _redact_exception(exc, secret) from None
+        except Exception as exc:  # noqa: BLE001 — never leak the bearer token
+            raise OpenAICompatHttpError(_safe_text(str(exc), secret), retryable=True) from None
+        finally:
+            secret = None
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelChunk]:
         body = encode_chat_request(request, self._config, stream=True)
-        response = await self._send(body, stream=True)
-        async for chunk in decode_chat_stream(response, provider=self.name):
-            yield chunk
-
-    async def _send(self, body: dict[str, Any], *, stream: bool) -> HttpResponse:
-        url = chat_completions_url(self._config.base_url, self._config.chat_completions_path)
-        payload = json.dumps(body).encode("utf-8")
         secret: str | None = None
-        headers: dict[str, str] = {}
         try:
             secret = await self._reveal_secret()
-            headers = {
-                "Authorization": f"Bearer {secret}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream" if stream else "application/json",
-                "User-Agent": "agentsphere-openai-compat/0.1",
-            }
+            response = await self._exchange(body, secret, stream=True)
+            async for chunk in decode_chat_stream(response, provider=self.name, secret=secret):
+                yield chunk
+        except OpenAICompatError as exc:
+            raise _redact_exception(exc, secret) from None
+        except Exception as exc:  # noqa: BLE001 — never leak the bearer token
+            raise OpenAICompatHttpError(_safe_text(str(exc), secret), retryable=True) from None
+        finally:
+            secret = None
+
+    async def _exchange(self, body: dict[str, Any], secret: str, *, stream: bool) -> HttpResponse:
+        url = chat_completions_url(self._config.base_url, self._config.chat_completions_path)
+        payload = json.dumps(body).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {secret}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if stream else "application/json",
+            "User-Agent": "agentsphere-openai-compat/0.1",
+        }
+        try:
             result = await self._transport.post(
                 url,
                 headers=headers,
@@ -404,16 +441,11 @@ class OpenAICompatibleProvider:
                 timeout_seconds=self._config.timeout_seconds,
                 stream=stream,
             )
-            if result.status >= 400:
-                raise _http_error(result)
-            return result
-        except OpenAICompatError as exc:
-            raise _redact_exception(exc, secret) from None
-        except Exception as exc:  # noqa: BLE001 — never leak the bearer token
-            raise OpenAICompatHttpError(_safe_text(str(exc), secret), retryable=True) from None
         finally:
             headers.clear()
-            secret = None
+        if result.status >= 300:
+            raise _http_error(result)
+        return result
 
     async def _reveal_secret(self) -> str:
         from agentsphere.identity.vault import VaultError
@@ -429,7 +461,7 @@ class OpenAICompatibleProvider:
             raise OpenAICompatNotConfigured(
                 f"credential {self._config.secret_name!r} is unavailable"
             ) from exc
-        if not secret:
+        if not (secret or "").strip():
             raise OpenAICompatNotConfigured(f"credential {self._config.secret_name!r} is empty")
         return secret
 
@@ -487,16 +519,29 @@ def config_from_env(*, agent_id: str | None = None) -> OpenAICompatConfig:
 
 
 def chat_completions_url(base_url: str, path: str = DEFAULT_CHAT_PATH) -> str:
-    base = (base_url or "").strip().rstrip("/")
+    base = (base_url or "").strip()
     if not base:
         raise OpenAICompatNotConfigured("base URL is empty")
     parsed = urlparse(base)
     if parsed.scheme not in {"http", "https"}:
         raise OpenAICompatNotConfigured("base URL must be http or https")
+    if parsed.username is not None or parsed.password is not None or "@" in (parsed.netloc or ""):
+        raise OpenAICompatNotConfigured("base URL must not include userinfo")
+    if not parsed.hostname:
+        raise OpenAICompatNotConfigured("base URL is missing a host")
     suffix = path if path.startswith("/") else f"/{path}"
-    if base.endswith(suffix):
-        return base
-    return f"{base}{suffix}"
+    suffix_norm = suffix.rstrip("/")
+    normalized = (parsed.path or "").rstrip("/")
+    if normalized.endswith(suffix_norm):
+        new_path = normalized
+    else:
+        new_path = f"{normalized}{suffix}" if normalized else suffix
+    query = parsed.query or ""
+    if query:
+        for key, _value in parse_qsl(query, keep_blank_values=True):
+            if _is_secret_query_name(key):
+                raise OpenAICompatNotConfigured("base URL must not include secret query parameters")
+    return urlunparse((parsed.scheme, parsed.netloc, new_path, "", query, ""))
 
 
 def encode_chat_request(
@@ -535,7 +580,12 @@ def encode_chat_request(
     return body
 
 
-def decode_chat_response(response: HttpResponse, *, provider: str) -> ModelResponse:
+def decode_chat_response(
+    response: HttpResponse,
+    *,
+    provider: str,
+    secret: str | None = None,
+) -> ModelResponse:
     try:
         payload = response.json()
     except json.JSONDecodeError as exc:
@@ -544,7 +594,10 @@ def decode_chat_response(response: HttpResponse, *, provider: str) -> ModelRespo
         raise OpenAICompatError("vendor returned a non-object Chat Completions body")
     error = payload.get("error")
     if error:
-        raise OpenAICompatHttpError(_error_message(error, response.status), status=response.status)
+        raise OpenAICompatHttpError(
+            _safe_text(_error_message(error, response.status), secret),
+            status=response.status,
+        )
     choices = payload.get("choices") or []
     if not choices:
         raise OpenAICompatError("vendor returned no choices")
@@ -552,19 +605,21 @@ def decode_chat_response(response: HttpResponse, *, provider: str) -> ModelRespo
     content = message.get("content")
     tool_calls = [_decode_tool_call(item) for item in message.get("tool_calls") or []]
     usage = _decode_usage(payload.get("usage") or {})
-    return ModelResponse(
+    decoded = ModelResponse(
         content=content if isinstance(content, str) else (None if tool_calls else ""),
         tool_calls=tool_calls,
         usage=usage,
         provider=provider,
-        raw=_safe_raw(payload),
+        raw=_safe_raw(payload, secret=secret),
     )
+    return _redact_model_response(decoded, secret)
 
 
 async def decode_chat_stream(
     response: HttpResponse,
     *,
     provider: str,
+    secret: str | None = None,
 ) -> AsyncIterator[ModelChunk]:
     content_parts: list[str] = []
     tool_acc: dict[int, dict[str, str]] = {}
@@ -585,9 +640,12 @@ async def decode_chat_stream(
             raise OpenAICompatError("vendor returned non-JSON SSE chunk") from exc
         if not isinstance(payload, dict):
             continue
-        raw_chunks.append(_safe_raw(payload))
+        raw_chunks.append(_safe_raw(payload, secret=secret))
         if payload.get("error"):
-            raise OpenAICompatHttpError(_error_message(payload.get("error"), response.status), status=response.status)
+            raise OpenAICompatHttpError(
+                _safe_text(_error_message(payload.get("error"), response.status), secret),
+                status=response.status,
+            )
         usage_payload = payload.get("usage")
         if usage_payload:
             usage = _decode_usage(usage_payload)
@@ -599,6 +657,7 @@ async def decode_chat_stream(
         delta = choice.get("delta") or choice.get("message") or {}
         piece = delta.get("content")
         if isinstance(piece, str) and piece:
+            piece = _safe_text(piece, secret)
             content_parts.append(piece)
             yield ModelChunk(delta=piece, done=False)
         for item in delta.get("tool_calls") or []:
@@ -606,18 +665,21 @@ async def decode_chat_stream(
     tool_calls = [
         ToolCall(
             id=slot.get("id") or f"call_{index}",
-            name=slot.get("name") or "",
-            arguments=_parse_arguments(slot.get("arguments") or ""),
+            name=_safe_text(slot.get("name") or "", secret),
+            arguments=_redact_data(_parse_arguments(slot.get("arguments") or ""), secret),
         )
         for index, slot in sorted(tool_acc.items())
     ]
     content = "".join(content_parts)
-    final = ModelResponse(
-        content=content if content else (None if tool_calls else ""),
-        tool_calls=tool_calls,
-        usage=usage,
-        provider=provider,
-        raw={"chunks": raw_chunks, "finish_reason": finish_reason},
+    final = _redact_model_response(
+        ModelResponse(
+            content=content if content else (None if tool_calls else ""),
+            tool_calls=tool_calls,
+            usage=usage,
+            provider=provider,
+            raw={"chunks": raw_chunks, "finish_reason": finish_reason},
+        ),
+        secret,
     )
     for call in tool_calls:
         yield ModelChunk(delta="", done=False, tool_call_delta=call)
@@ -750,7 +812,7 @@ def _live_openai_compat(
             raise OpenAICompatNotConfigured(
                 "openai-compat live HTTP is opt-in; pass a transport or allow_network=True"
             )
-        bound = StdlibHttpTransport(allow_public_network=True)
+        bound = StdlibHttpTransport(allow_public_network=True, honor_proxy=True)
     return OpenAICompatibleProvider(config, vault=vault, transport=bound)
 
 
@@ -883,6 +945,12 @@ def _sse_line(payload: Mapping[str, Any]) -> str:
 
 
 def _http_error(response: HttpResponse) -> OpenAICompatHttpError:
+    if 300 <= response.status < 400:
+        return OpenAICompatHttpError(
+            f"vendor HTTP {response.status}: redirects are not followed",
+            status=response.status,
+            retryable=False,
+        )
     message = f"vendor HTTP {response.status}"
     try:
         payload = response.json()
@@ -904,12 +972,57 @@ def _error_message(error: Any, status: int) -> str:
     return f"vendor HTTP {status}: {text}" if status else text
 
 
-def _safe_raw(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _safe_raw(payload: Mapping[str, Any], *, secret: str | None = None) -> dict[str, Any]:
+    keep = {key: payload[key] for key in ("id", "object", "model", "choices", "usage") if key in payload}
+    redacted = _redact_data(keep, secret)
+    return redacted if isinstance(redacted, dict) else {}
+
+
+def _redact_data(value: Any, secret: str | None) -> Any:
     from agentsphere.identity.redact import redact
 
-    keep = {key: payload[key] for key in ("id", "object", "model", "choices", "usage") if key in payload}
-    redacted = redact(keep)
-    return redacted if isinstance(redacted, dict) else {}
+    extra = {secret} if secret else set()
+    return redact(value, extra_secrets=extra)
+
+
+def _redact_model_response(response: ModelResponse, secret: str | None) -> ModelResponse:
+    if not secret:
+        return response
+    content = response.content
+    if isinstance(content, str):
+        content = _safe_text(content, secret)
+    tool_calls = [
+        call.model_copy(
+            update={
+                "name": _safe_text(call.name, secret),
+                "arguments": _redact_data(call.arguments, secret),
+            }
+        )
+        for call in response.tool_calls
+    ]
+    raw = _redact_data(response.raw, secret)
+    if not isinstance(raw, dict):
+        raw = {}
+    return response.model_copy(update={"content": content, "tool_calls": tool_calls, "raw": raw})
+
+
+def _public_url(url: str) -> str:
+    from agentsphere.identity.redact import REDACTED
+
+    parsed = urlparse(url)
+    netloc = parsed.netloc or ""
+    if "@" in netloc:
+        host = parsed.hostname or "redacted-host"
+        netloc = f"{host}:{parsed.port}" if parsed.port else host
+    pairs: list[tuple[str, str]] = []
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        pairs.append((key, REDACTED if _is_secret_query_name(key) else value))
+    query = urlencode(pairs)
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", query, ""))
+
+
+def _is_secret_query_name(key: str) -> bool:
+    return _is_blocked_extra(key)
 
 
 def _public_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -946,16 +1059,14 @@ def _is_loopback_host(host: str | None) -> bool:
         return False
 
 
-def _safe_text(text: str, secret: str | None) -> str:
+def _safe_text(text: str | None, secret: str | None) -> str:
     from agentsphere.identity.redact import REDACTED
 
     if not text:
+        return text or ""
+    if not secret:
         return text
-    redacted = text
-    if secret:
-        redacted = redacted.replace(secret, REDACTED)
-        redacted = redacted.replace(f"Bearer {secret}", f"Bearer {REDACTED}")
-    return redacted
+    return text.replace(secret, REDACTED)
 
 
 def _redact_exception(exc: OpenAICompatError, secret: str | None) -> OpenAICompatError:

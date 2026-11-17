@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
 from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +33,7 @@ from agentsphere.model_adapter.openai_compat import (
     ENV_SECRET_NAME,
     OpenAICompatHttpError,
     OpenAICompatNotConfigured,
+    _public_url,
     chat_completions_url,
     encode_chat_request,
     openai_chat_response,
@@ -158,6 +160,12 @@ async def test_missing_or_empty_vault_secret_fails_closed() -> None:
 
     vault = await _vault(identity.agent_id, secret="")
     provider = _provider(vault, transport, agent_id=identity.agent_id)
+    with pytest.raises(OpenAICompatNotConfigured, match="empty"):
+        await provider.complete(_request())
+    assert transport.calls == []
+
+    whitespace = await _vault(identity.agent_id, secret="   \t  ")
+    provider = _provider(whitespace, transport, agent_id=identity.agent_id)
     with pytest.raises(OpenAICompatNotConfigured, match="empty"):
         await provider.complete(_request())
     assert transport.calls == []
@@ -411,8 +419,18 @@ async def test_chat_completions_url_joins_and_rejects_bad_schemes() -> None:
         chat_completions_url("https://api.openai.com/v1/chat/completions")
         == "https://api.openai.com/v1/chat/completions"
     )
+    assert (
+        chat_completions_url("https://api.openai.com/v1?foo=bar")
+        == "https://api.openai.com/v1/chat/completions?foo=bar"
+    )
     with pytest.raises(OpenAICompatNotConfigured):
         chat_completions_url("file:///tmp/secrets")
+    with pytest.raises(OpenAICompatNotConfigured, match="userinfo"):
+        chat_completions_url(f"https://{SECRET}@api.openai.com/v1")
+    with pytest.raises(OpenAICompatNotConfigured, match="secret query"):
+        chat_completions_url(f"https://api.openai.com/v1?api_key={SECRET}")
+    with pytest.raises(OpenAICompatNotConfigured, match="secret query"):
+        chat_completions_url(f"https://api.openai.com/v1?access_token={SECRET}")
 
 
 async def test_encode_chat_request_omits_empty_tools() -> None:
@@ -481,7 +499,7 @@ async def test_stdlib_transport_against_local_fake_server(monkeypatch: pytest.Mo
     try:
         provider = _provider(
             vault,
-            StdlibHttpTransport(honor_proxy=False),
+            StdlibHttpTransport(),
             agent_id=identity.agent_id,
             base_url=base_url,
         )
@@ -504,7 +522,7 @@ async def test_stdlib_stream_against_local_fake_server(monkeypatch: pytest.Monke
     try:
         provider = _provider(
             vault,
-            StdlibHttpTransport(honor_proxy=False),
+            StdlibHttpTransport(),
             agent_id=identity.agent_id,
             base_url=base_url,
         )
@@ -569,3 +587,318 @@ async def test_factory_live_transport_is_opt_in_and_does_not_call_vendor(
     assert isinstance(provider, OpenAICompatibleProvider)
     assert isinstance(provider._transport, StdlibHttpTransport)
     assert provider._transport.allow_public_network is True
+    assert provider._transport.honor_proxy is True
+
+
+async def test_http_200_error_field_redacts_secret() -> None:
+    identity = AgentIdentity(name="compat-agent")
+    vault = await _vault(identity.agent_id)
+    transport = ScriptedHttpTransport(
+        script=[{"error": {"message": f"invalid key {SECRET}", "type": "invalid_request_error"}}]
+    )
+    provider = _provider(vault, transport, agent_id=identity.agent_id)
+    with pytest.raises(OpenAICompatHttpError) as info:
+        await provider.complete(_request())
+    assert SECRET not in str(info.value)
+    assert SECRET not in repr(info.value)
+    assert "[redacted]" in str(info.value)
+
+
+async def test_success_body_echo_is_redacted_in_response_events_and_traces() -> None:
+    identity = AgentIdentity(name="compat-agent")
+    vault = await _vault(identity.agent_id)
+    echoed = f"your key is {SECRET}"
+    transport = ScriptedHttpTransport(
+        script=[
+            openai_chat_response(content=echoed),
+            openai_chat_response(
+                content=None,
+                tool_calls=[openai_tool_call("echo", {"text": SECRET}, call_id="call_leak")],
+            ),
+        ]
+    )
+    provider = _provider(vault, transport, agent_id=identity.agent_id)
+    response = await provider.complete(_request())
+    assert response.content is not None
+    assert "your key is" in response.content
+    assert SECRET not in response.content
+    _assert_secret_absent(response.raw, response.model_dump())
+
+    tool_response = await provider.complete(_request(tools=[ToolDefinition(name="echo")]))
+    assert tool_response.has_tool_calls
+    assert SECRET not in json.dumps(tool_response.tool_calls[0].arguments)
+    assert SECRET not in json.dumps(tool_response.raw)
+
+    tracer = TraceRecorder()
+    harness = AgentHarness(ReActStrategy(), ModelAdapter(provider), max_steps=4)
+    harness.event_emitter.add_listener(tracer)
+    echo_transport = ScriptedHttpTransport(script=[openai_chat_response(content=echoed)])
+    harness.model_adapter = ModelAdapter(_provider(vault, echo_transport, agent_id=identity.agent_id))
+    events = [event async for event in harness.run_turn(SessionState(session_id="s-echo"), "hello")]
+    blob = " ".join(event.model_dump_json() for event in events)
+    assert any(event.type is EventType.MODEL_CALL_COMPLETED for event in events)
+    assert SECRET not in blob
+    assert SECRET not in tracer.inspect("s-echo").model_dump_json()
+    completed = next(event for event in events if event.type is EventType.MODEL_CALL_COMPLETED)
+    assert "your key is" in str(completed.payload.get("content", ""))
+
+
+async def test_stream_echo_redacts_secret() -> None:
+    identity = AgentIdentity(name="compat-agent")
+    vault = await _vault(identity.agent_id)
+    transport = ScriptedHttpTransport(script=[openai_sse_text([f"your key is {SECRET}"])])
+    provider = _provider(vault, transport, agent_id=identity.agent_id)
+    chunks = [chunk async for chunk in provider.stream(_request(params=InferenceParams(stream=True)))]
+    joined = "".join(chunk.delta for chunk in chunks)
+    assert SECRET not in joined
+    assert chunks[-1].response is not None
+    _assert_secret_absent(chunks[-1].response.model_dump(), chunks[-1].response.raw)
+
+
+async def test_userinfo_and_secret_query_urls_fail_closed() -> None:
+    identity = AgentIdentity(name="compat-agent")
+    vault = await _vault(identity.agent_id)
+    transport = ScriptedHttpTransport(script=[openai_chat_response(content="nope")])
+    with pytest.raises(OpenAICompatNotConfigured, match="userinfo"):
+        _provider(
+            vault,
+            transport,
+            agent_id=identity.agent_id,
+            base_url=f"https://{SECRET}@api.openai.com/v1",
+        )
+    with pytest.raises(OpenAICompatNotConfigured, match="secret query"):
+        _provider(
+            vault,
+            transport,
+            agent_id=identity.agent_id,
+            base_url=f"https://api.openai.com/v1?api_key={SECRET}",
+        )
+    assert transport.calls == []
+    assert SECRET not in _public_url(f"https://{SECRET}@api.openai.com/v1")
+    assert SECRET not in _public_url(f"https://api.openai.com/v1?api_key={SECRET}")
+    assert SECRET not in repr(
+        OpenAICompatibleProvider.from_settings(
+            base_url=BASE_URL,
+            model=MODEL,
+            secret_name=SECRET_NAME,
+            agent_id=identity.agent_id,
+            vault=vault,
+            transport=transport,
+        )
+    )
+
+
+class _RedirectOrigin(ThreadingHTTPServer):
+    location: str
+    captured_auth: list[str]
+
+
+class _AuthSink(ThreadingHTTPServer):
+    captured_auth: list[str]
+    hits: int
+
+
+class _RecordingProxy(ThreadingHTTPServer):
+    captured_auth: list[str]
+    paths: list[str]
+
+
+def _start_redirect_origin(location: str) -> tuple[_RedirectOrigin, str]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            server: _RedirectOrigin = self.server  # type: ignore[assignment]
+            server.captured_auth.append(self.headers.get("Authorization") or "")
+            self.send_response(302)
+            self.send_header("Location", server.location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            del fmt, args
+
+    server = _RedirectOrigin(("127.0.0.1", 0), Handler)
+    server.location = location
+    server.captured_auth = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    return server, f"http://{host}:{port}/v1"
+
+
+def _start_auth_sink(host: str = "127.0.0.2") -> tuple[_AuthSink, str]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            server: _AuthSink = self.server  # type: ignore[assignment]
+            server.captured_auth.append(self.headers.get("Authorization") or "")
+            server.hits += 1
+            payload = json.dumps(openai_chat_response(content="from-sink")).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self) -> None:  # noqa: N802
+            self.do_POST()
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            del fmt, args
+
+    try:
+        server = _AuthSink((host, 0), Handler)
+    except OSError as exc:
+        pytest.skip(f"{host} is not bindable: {exc}")
+    server.captured_auth = []
+    server.hits = 0
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    bound_host, port = server.server_address[:2]
+    return server, f"http://{bound_host}:{port}/v1/chat/completions"
+
+
+def _start_recording_proxy() -> tuple[_RecordingProxy, str]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            server: _RecordingProxy = self.server  # type: ignore[assignment]
+            server.captured_auth.append(self.headers.get("Authorization") or "")
+            server.paths.append(self.path)
+            payload = json.dumps(openai_chat_response(content="from-proxy")).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_CONNECT(self) -> None:  # noqa: N802
+            server: _RecordingProxy = self.server  # type: ignore[assignment]
+            server.paths.append("CONNECT " + self.path)
+            server.captured_auth.append(self.headers.get("Authorization") or "")
+            self.send_error(403)
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            del fmt, args
+
+    server = _RecordingProxy(("127.0.0.1", 0), Handler)
+    server.captured_auth = []
+    server.paths = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    return server, f"http://{host}:{port}"
+
+
+async def test_stdlib_does_not_follow_redirect_to_other_host() -> None:
+    identity = AgentIdentity(name="compat-agent")
+    vault = await _vault(identity.agent_id)
+    sink, sink_url = _start_auth_sink("127.0.0.2")
+    origin, origin_url = _start_redirect_origin(sink_url)
+    try:
+        provider = _provider(
+            vault,
+            StdlibHttpTransport(),
+            agent_id=identity.agent_id,
+            base_url=origin_url,
+        )
+        with pytest.raises(OpenAICompatHttpError, match="redirects are not followed") as info:
+            await provider.complete(_request())
+        assert info.value.status == 302
+        assert sink.hits == 0
+        assert sink.captured_auth == []
+        assert origin.captured_auth == [f"Bearer {SECRET}"]
+    finally:
+        origin.shutdown()
+        origin.server_close()
+        sink.shutdown()
+        sink.server_close()
+
+
+async def test_stdlib_does_not_follow_redirect_to_non_loopback() -> None:
+    identity = AgentIdentity(name="compat-agent")
+    vault = await _vault(identity.agent_id)
+    origin, origin_url = _start_redirect_origin("http://192.0.2.1:9/v1/chat/completions")
+    seen: list[tuple[Any, ...]] = []
+    real_connect = socket.create_connection
+
+    def hooked(address, *args, **kwargs):  # noqa: ANN001
+        seen.append(address if isinstance(address, tuple) else (address,))
+        return real_connect(address, *args, **kwargs)
+
+    try:
+        socket.create_connection = hooked  # type: ignore[method-assign]
+        provider = _provider(
+            vault,
+            StdlibHttpTransport(),
+            agent_id=identity.agent_id,
+            base_url=origin_url,
+        )
+        with pytest.raises(OpenAICompatHttpError, match="redirects are not followed"):
+            await provider.complete(_request())
+        assert not any(item and str(item[0]) == "192.0.2.1" for item in seen)
+    finally:
+        socket.create_connection = real_connect  # type: ignore[method-assign]
+        origin.shutdown()
+        origin.server_close()
+
+
+async def test_stdlib_live_transport_does_not_forward_bearer_on_cross_host_redirect() -> None:
+    identity = AgentIdentity(name="compat-agent")
+    vault = await _vault(identity.agent_id)
+    sink, sink_url = _start_auth_sink("127.0.0.2")
+    origin, origin_url = _start_redirect_origin(sink_url)
+    try:
+        provider = _provider(
+            vault,
+            StdlibHttpTransport(allow_public_network=True, honor_proxy=True),
+            agent_id=identity.agent_id,
+            base_url=origin_url,
+        )
+        with pytest.raises(OpenAICompatHttpError, match="redirects are not followed"):
+            await provider.complete(_request())
+        assert sink.hits == 0
+        assert sink.captured_auth == []
+        assert all(SECRET not in value for value in sink.captured_auth)
+    finally:
+        origin.shutdown()
+        origin.server_close()
+        sink.shutdown()
+        sink.server_close()
+
+
+async def test_stdlib_loopback_only_does_not_honor_http_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    proxy, proxy_url = _start_recording_proxy()
+    monkeypatch.setenv("HTTP_PROXY", proxy_url)
+    monkeypatch.setenv("http_proxy", proxy_url)
+    monkeypatch.setenv("HTTPS_PROXY", proxy_url)
+    monkeypatch.setenv("https_proxy", proxy_url)
+    identity = AgentIdentity(name="compat-agent")
+    vault = await _vault(identity.agent_id)
+    vendor, vendor_url = _start_fake_vendor(mode="complete")
+    try:
+        default_transport = StdlibHttpTransport()
+        assert default_transport.honor_proxy is False
+        provider = _provider(
+            vault,
+            default_transport,
+            agent_id=identity.agent_id,
+            base_url=vendor_url,
+        )
+        response = await provider.complete(_request())
+        assert response.content == "from-loopback"
+        assert proxy.paths == []
+        assert proxy.captured_auth == []
+        assert vendor.captured_auth == [f"Bearer {SECRET}"]
+        _assert_secret_absent(response.model_dump())
+    finally:
+        vendor.shutdown()
+        vendor.server_close()
+        proxy.shutdown()
+        proxy.server_close()
+
