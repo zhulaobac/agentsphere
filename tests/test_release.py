@@ -10,6 +10,7 @@ from agentsphere.controlplane import (
     AssetNotFoundError,
     AssetRef,
     AuthorizationError,
+    CANARY_WEIGHT,
     ControlPlane,
     DeploymentStatus,
     LifecycleError,
@@ -211,5 +212,103 @@ async def test_auto_rollback_semver_fallback_restores_1_10_0(principal: Principa
     )
     restored = await cp.get_artifact("bot", "1.10.0", principal)
     assert restored.status.phase is LifecyclePhase.RELEASED
+    assert restored.status.releaseChannel is ReleaseChannel.CANARY
     current = await cp.get_artifact("bot", "1.11.0", principal)
     assert current.status.phase is LifecyclePhase.DEPRECATED
+
+
+async def test_rollback_to_self_canary_is_rejected(principal: Principal) -> None:
+    cp = ControlPlane()
+    await _ship(cp, principal, version="0.1.0")
+    before = await cp.get_artifact("bot", "0.1.0", principal)
+    assert before.status.releaseChannel is ReleaseChannel.CANARY
+    with pytest.raises(LifecycleError, match="promote"):
+        await cp.rollback("bot", principal, to_version="0.1.0", reason="emergency first ship")
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.RELEASED
+    assert still.status.releaseChannel is ReleaseChannel.CANARY
+    active = [
+        d
+        for d in cp.store.list_deployments(tenant=principal.tenant, name="bot")
+        if d.status is DeploymentStatus.ACTIVE
+    ]
+    assert active
+    assert all(d.channel is ReleaseChannel.CANARY for d in active)
+    assert all(d.weight < 1.0 for d in active)
+
+
+async def test_rollback_never_promoted_previous_canary_restores_canary(principal: Principal) -> None:
+    cp = ControlPlane()
+    await _ship(cp, principal, version="1.0.0")
+    await _ship(cp, principal, version="1.1.0")
+    restored, dep = await cp.rollback("bot", principal, to_version="1.0.0")
+    assert restored.version == "1.0.0"
+    assert restored.status.releaseChannel is ReleaseChannel.CANARY
+    assert dep.channel is ReleaseChannel.CANARY
+    assert dep.weight == CANARY_WEIGHT
+    failing = await cp.get_artifact("bot", "1.1.0", principal)
+    assert failing.status.phase is LifecyclePhase.DEPRECATED
+
+
+async def test_canary_weight_one_is_rejected(principal: Principal) -> None:
+    cp = ControlPlane()
+    try:
+        await cp.get_asset(AssetKind.PROMPT, "sys", "1.0.0", principal)
+    except AssetNotFoundError:
+        await cp.put_asset(
+            kind=AssetKind.PROMPT,
+            metadata=AssetMetadata(name="sys", owner=principal.owner, tenant=principal.tenant),
+            version="1.0.0",
+            spec={"text": "You are a bot."},
+            principal=principal,
+        )
+    await cp.put_artifact(
+        AgentArtifact(
+            metadata=AssetMetadata(name="bot", owner=principal.owner, tenant=principal.tenant),
+            spec=AgentSpec(prompts=[AssetRef(kind=AssetKind.PROMPT, name="sys", version="1.0.0")]),
+            version="0.1.0",
+        ),
+        principal,
+    )
+    await cp.build("bot", "0.1.0", principal)
+    cp.register_experiment(stub_experiment_run("exp-weight", "bot", "0.1.0"))
+    await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp-weight")
+    await cp.approve("bot", "0.1.0", principal)
+    await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-weight")
+    with pytest.raises(LifecycleError, match="weight"):
+        await cp.release("bot", "0.1.0", principal, channel=ReleaseChannel.CANARY, weight=1.0)
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.APPROVED
+    assert still.status.deployedVersions == []
+
+
+async def test_release_channel_string_full_raises_lifecycle_error(principal: Principal) -> None:
+    cp = ControlPlane()
+    try:
+        await cp.get_asset(AssetKind.PROMPT, "sys", "1.0.0", principal)
+    except AssetNotFoundError:
+        await cp.put_asset(
+            kind=AssetKind.PROMPT,
+            metadata=AssetMetadata(name="sys", owner=principal.owner, tenant=principal.tenant),
+            version="1.0.0",
+            spec={"text": "You are a bot."},
+            principal=principal,
+        )
+    await cp.put_artifact(
+        AgentArtifact(
+            metadata=AssetMetadata(name="bot", owner=principal.owner, tenant=principal.tenant),
+            spec=AgentSpec(prompts=[AssetRef(kind=AssetKind.PROMPT, name="sys", version="1.0.0")]),
+            version="0.1.0",
+        ),
+        principal,
+    )
+    await cp.build("bot", "0.1.0", principal)
+    cp.register_experiment(stub_experiment_run("exp-str-full", "bot", "0.1.0"))
+    await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp-str-full")
+    await cp.approve("bot", "0.1.0", principal)
+    await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-str-full")
+    with pytest.raises(LifecycleError, match="promote an active Canary"):
+        await cp.release("bot", "0.1.0", principal, channel="Full")  # type: ignore[arg-type]
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.APPROVED
+    assert still.status.deployedVersions == []

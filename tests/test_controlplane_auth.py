@@ -99,17 +99,40 @@ async def test_foreign_principal_cannot_read_events_or_lineage(
     principal: Principal, other_tenant: Principal
 ) -> None:
     cp = ControlPlane()
+    await cp.put_asset(
+        kind=AssetKind.PROMPT,
+        metadata=AssetMetadata(name="sys", owner=principal.owner, tenant=principal.tenant),
+        version="1.0.0",
+        spec={"text": "x"},
+        principal=principal,
+    )
     stored = await cp.put_artifact(
         AgentArtifact(
             metadata=AssetMetadata(name="secret", owner=principal.owner, tenant=principal.tenant),
-            spec=AgentSpec(),
+            spec=AgentSpec(prompts=[AssetRef(kind=AssetKind.PROMPT, name="sys", version="1.0.0")]),
             version="0.1.0",
         ),
         principal,
     )
-    ref = AssetRef(kind=AssetKind.AGENT, name="secret", version="0.1.0", tenant=principal.tenant)
+    agent_ref = AssetRef(kind=AssetKind.AGENT, name="secret", version="0.1.0", tenant=principal.tenant)
+    prompt_ref = AssetRef(kind=AssetKind.PROMPT, name="sys", version="1.0.0", tenant=principal.tenant)
+    alice_uses = cp.lineage(agent_ref, principal)
+    alice_used_by = cp.lineage(prompt_ref, principal)
+    assert alice_uses["uses"]
+    assert alice_used_by["used_by"]
+
     with pytest.raises(AuthorizationError):
         cp.events_for(stored.resource_key(), other_tenant, tenant=principal.tenant)
     with pytest.raises(AuthorizationError):
-        cp.lineage(ref, other_tenant, tenant=principal.tenant)
+        cp.lineage(agent_ref, other_tenant, tenant=principal.tenant)
     assert cp.events_for(stored.resource_key(), other_tenant) == []
+
+    with pytest.raises(AuthorizationError):
+        cp.lineage(agent_ref, other_tenant)
+    with pytest.raises(AuthorizationError):
+        cp.lineage(prompt_ref, other_tenant)
+    unscoped = cp.lineage(
+        AssetRef(kind=AssetKind.AGENT, name="secret", version="0.1.0"),
+        other_tenant,
+    )
+    assert unscoped == {"uses": [], "used_by": []}

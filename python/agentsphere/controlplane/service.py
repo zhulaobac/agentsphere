@@ -13,6 +13,7 @@ from agentsphere.controlplane.auth import assert_can_mutate, assert_can_read, as
 from agentsphere.controlplane.errors import (
     ArtifactNotFoundError,
     AssetNotFoundError,
+    AuthorizationError,
     DependencyError,
     DuplicateAssetError,
     GateFailedError,
@@ -40,6 +41,15 @@ from agentsphere.controlplane.types import (
 from agentsphere.kernel.ids import new_id
 
 
+def _as_release_channel(channel: Any) -> ReleaseChannel:
+    if isinstance(channel, ReleaseChannel):
+        return channel
+    try:
+        return ReleaseChannel(channel)
+    except (TypeError, ValueError) as exc:
+        raise LifecycleError(f"invalid release channel {channel!r}") from exc
+
+
 class ControlPlane:
     def __init__(
         self,
@@ -56,8 +66,11 @@ class ControlPlane:
         run_id = getattr(run, "run_id", None)
         if not run_id:
             raise LifecycleError("experiment run is missing run_id")
+        key = str(run_id)
+        if key in self._experiments:
+            raise LifecycleError(f"experiment run {key} is immutable")
         stored = run.model_copy(deep=True) if hasattr(run, "model_copy") else run
-        self._experiments[str(run_id)] = stored
+        self._experiments[key] = stored
         return stored
 
     def get_experiment(self, run_id: str) -> Any | None:
@@ -260,6 +273,12 @@ class ControlPlane:
         spec = getattr(run, "spec", None)
         if spec is not None and (spec.agent_name != name or spec.agent_version != version):
             raise LifecycleError(f"experiment run {run_id} does not belong to {name}@{version}")
+        if not artifact.status.lastExperimentRunId:
+            raise LifecycleError("cannot record a Gate before evaluation")
+        if run_id != artifact.status.lastExperimentRunId:
+            raise LifecycleError(
+                "Gate experiment run does not match the recorded evaluation"
+            )
         baseline = self.get_experiment(baseline_run_id) if baseline_run_id else None
         from agentsphere.evaluation.gate import ReleaseGate
 
@@ -345,6 +364,17 @@ class ControlPlane:
             raise
 
         verified = verify_gate_decision(stored_gate)
+        try:
+            channel = _as_release_channel(channel)
+        except LifecycleError:
+            await self._emit(
+                ControlEventType.RELEASE_BLOCKED,
+                principal,
+                resource=artifact.resource_key(),
+                tenant=artifact.metadata.tenant,
+                details={"reason": "invalid_channel", "channel": str(channel)},
+            )
+            raise
         if channel is not ReleaseChannel.CANARY:
             await self._emit(
                 ControlEventType.RELEASE_BLOCKED,
@@ -356,6 +386,15 @@ class ControlPlane:
             raise LifecycleError(
                 "cannot Release to Full; promote an active Canary instead"
             )
+        if weight is not None and weight >= 1.0:
+            await self._emit(
+                ControlEventType.RELEASE_BLOCKED,
+                principal,
+                resource=artifact.resource_key(),
+                tenant=artifact.metadata.tenant,
+                details={"reason": "canary_weight", "weight": weight},
+            )
+            raise LifecycleError("canary weight must be < 1.0; promote for Full")
         if verified.experiment_run_id != artifact.status.lastExperimentRunId:
             await self._emit(
                 ControlEventType.RELEASE_BLOCKED,
@@ -373,9 +412,7 @@ class ControlPlane:
                 decision=verified,
             )
 
-        desired_weight = weight if weight is not None else (
-            CANARY_WEIGHT if channel is ReleaseChannel.CANARY else FULL_WEIGHT
-        )
+        desired_weight = CANARY_WEIGHT if weight is None else weight
         for existing in self.store.list_deployments(
             tenant=artifact.metadata.tenant, name=name, environment=environment
         ):
@@ -540,6 +577,21 @@ class ControlPlane:
             if d.status is DeploymentStatus.ACTIVE
         ]
         from_ver = from_version or (current_active[-1].agent_version if current_active else None)
+        if from_ver == to_version and any(
+            d.agent_version == to_version and d.channel is ReleaseChannel.CANARY
+            for d in current_active
+        ):
+            raise LifecycleError(
+                "cannot rollback the active canary of this version; promote instead"
+            )
+        restore_full = self._version_was_full(
+            tenant=target.metadata.tenant,
+            name=name,
+            version=to_version,
+            environment=environment,
+        )
+        restore_channel = ReleaseChannel.FULL if restore_full else ReleaseChannel.CANARY
+        restore_weight = FULL_WEIGHT if restore_full else CANARY_WEIGHT
         for dep in current_active:
             dep.status = DeploymentStatus.ROLLED_BACK
             dep.updated_at = datetime.now(timezone.utc)
@@ -572,20 +624,20 @@ class ControlPlane:
             agent_name=name,
             agent_version=to_version,
             environment=environment,
-            channel=ReleaseChannel.FULL,
-            weight=FULL_WEIGHT,
+            channel=restore_channel,
+            weight=restore_weight,
             reason=reason,
             rolled_back_from=from_ver,
         )
         stored = self.store.put_deployment(restored)
         target.status.phase = LifecyclePhase.RELEASED
-        target.status.releaseChannel = ReleaseChannel.FULL
+        target.status.releaseChannel = restore_channel
         target.status.deployedVersions.append(
             DeployedVersion(
                 version=to_version,
                 environment=environment,
-                channel=ReleaseChannel.FULL,
-                weight=FULL_WEIGHT,
+                channel=restore_channel,
+                weight=restore_weight,
                 deployment_id=stored.deployment_id,
                 status=DeploymentStatus.ACTIVE,
             )
@@ -667,12 +719,18 @@ class ControlPlane:
     def lineage(
         self, ref: AssetRef, principal: Principal, *, tenant: str | None = None
     ) -> dict[str, list[AssetRef]]:
-        tenant_id = tenant or principal.tenant or ref.tenant or ""
+        tenant_id = principal.tenant if tenant is None else tenant
         assert_same_tenant(principal, tenant_id, action="read", resource=ref.display())
+        if ref.tenant is not None and ref.tenant != tenant_id:
+            raise AuthorizationError(
+                f"tenant {principal.tenant!r} cannot read {ref.display()} owned by tenant {ref.tenant!r}"
+            )
         record = self.store.get_asset(ref.kind, tenant_id, ref.name, ref.version)
-        if record is not None:
-            assert_can_read(principal, record.metadata, resource=ref.display())
-        key = ref.key(tenant_id)
+        if record is None:
+            return {"uses": [], "used_by": []}
+        assert_can_read(principal, record.metadata, resource=ref.display())
+        scoped = ref.model_copy(update={"tenant": tenant_id})
+        key = scoped.key(tenant_id)
         outgoing = [e.target for e in self.store.list_edges(source=key)]
         incoming = [e.source for e in self.store.list_edges(target=key)]
         return {"uses": outgoing, "used_by": incoming}
@@ -803,8 +861,24 @@ class ControlPlane:
             return artifacts[-1].version
         return deployments[-1].agent_version
 
+    def _version_was_full(
+        self, *, tenant: str, name: str, version: str, environment: str
+    ) -> bool:
+        artifact = self.store.get_artifact(tenant, name, version)
+        if artifact is not None and artifact.status.releaseChannel is ReleaseChannel.FULL:
+            return True
+        return any(
+            d.agent_version == version and d.channel is ReleaseChannel.FULL
+            for d in self.store.list_deployments(
+                tenant=tenant, name=name, environment=environment
+            )
+        )
+
     def _load_stored_gate(self, artifact: AgentArtifact, *, gate_id: str | None) -> GateDecision:
-        resolved_id = gate_id or artifact.status.lastGateResultId
+        latest = artifact.status.lastGateResultId
+        if gate_id is not None and gate_id != latest:
+            raise GateFailedError("gate_id is not the latest stored Gate for this version")
+        resolved_id = latest
         if not resolved_id:
             raise GateFailedError("cannot Release without a stored Gate decision")
         stored = self.store.get_gate(resolved_id)

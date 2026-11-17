@@ -159,3 +159,54 @@ async def test_record_evaluation_requires_stored_run(principal: Principal) -> No
     await cp.build("bot", "0.1.0", principal)
     with pytest.raises(LifecycleError, match="unknown experiment run"):
         await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="i-never-ran")
+
+
+async def test_overwriting_failing_experiment_cannot_release(principal: Principal) -> None:
+    cp = ControlPlane()
+    await ready_draft(cp, principal)
+    await cp.build("bot", "0.1.0", principal)
+    cp.register_experiment(
+        stub_experiment_run("exp-fail", "bot", "0.1.0", pass_rate=0.0, safety_failed=True)
+    )
+    await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp-fail")
+    await cp.approve("bot", "0.1.0", principal)
+    _artifact, decision = await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-fail")
+    assert decision.passed is False
+    with pytest.raises(LifecycleError, match="immutable"):
+        cp.register_experiment(stub_experiment_run("exp-fail", "bot", "0.1.0", pass_rate=1.0))
+    with pytest.raises(GateFailedError):
+        await cp.release("bot", "0.1.0", principal)
+    _, again = await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-fail")
+    assert again.passed is False
+    with pytest.raises(GateFailedError):
+        await cp.release("bot", "0.1.0", principal)
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.APPROVED
+    assert still.status.deployedVersions == []
+
+
+async def test_stale_same_version_gate_id_is_rejected(principal: Principal) -> None:
+    cp = ControlPlane()
+    await _approved(cp, principal, run_id="exp-pass")
+    first, passing = await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-pass")
+    passing_id = first.status.lastGateResultId
+    assert passing.passed is True
+    assert passing_id
+
+    cp.register_experiment(
+        stub_experiment_run("exp-later-fail", "bot", "0.1.0", pass_rate=0.0, safety_failed=True)
+    )
+    with pytest.raises(LifecycleError, match="does not match"):
+        await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-later-fail")
+
+    second, _ = await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-pass")
+    latest_id = second.status.lastGateResultId
+    assert latest_id != passing_id
+
+    with pytest.raises(GateFailedError):
+        await cp.release("bot", "0.1.0", principal, gate_id=passing_id)
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.APPROVED
+    assert still.status.deployedVersions == []
+    assert still.status.lastGateResultId == latest_id
+    assert still.status.lastExperimentRunId == "exp-pass"
