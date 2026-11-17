@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import numbers
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from packaging.version import Version
@@ -72,11 +74,27 @@ def _snapshot_experiment_run(run: Any) -> Any:
     return copied
 
 
+def _is_bool_like(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    if type(value).__name__ in {"bool_", "bool8"}:
+        return True
+    dtype = getattr(value, "dtype", None)
+    if getattr(dtype, "kind", None) == "b" and getattr(value, "shape", None) == ():
+        return True
+    return False
+
+
 def _canonicalize_origin_value(value: Any) -> Any:
-    if isinstance(value, bool) or value is None:
-        return value
-    if isinstance(value, (int, float)):
-        return float(value)
+    if value is None:
+        return None
+    if _is_bool_like(value):
+        return bool(value)
+    if isinstance(value, (Decimal, numbers.Integral, numbers.Real)):
+        number = float(value)
+        if number == 0.0:
+            return 0.0
+        return number
     if isinstance(value, dict):
         return {str(key): _canonicalize_origin_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
