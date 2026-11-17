@@ -282,6 +282,40 @@ async def test_canary_weight_one_is_rejected(principal: Principal) -> None:
     assert still.status.deployedVersions == []
 
 
+async def test_canary_weight_nan_and_negative_are_rejected(principal: Principal) -> None:
+    cp = ControlPlane()
+    try:
+        await cp.get_asset(AssetKind.PROMPT, "sys", "1.0.0", principal)
+    except AssetNotFoundError:
+        await cp.put_asset(
+            kind=AssetKind.PROMPT,
+            metadata=AssetMetadata(name="sys", owner=principal.owner, tenant=principal.tenant),
+            version="1.0.0",
+            spec={"text": "You are a bot."},
+            principal=principal,
+        )
+    await cp.put_artifact(
+        AgentArtifact(
+            metadata=AssetMetadata(name="bot", owner=principal.owner, tenant=principal.tenant),
+            spec=AgentSpec(prompts=[AssetRef(kind=AssetKind.PROMPT, name="sys", version="1.0.0")]),
+            version="0.1.0",
+        ),
+        principal,
+    )
+    await cp.build("bot", "0.1.0", principal)
+    cp.register_experiment(stub_experiment_run("exp-nan", "bot", "0.1.0"))
+    await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp-nan")
+    await cp.approve("bot", "0.1.0", principal)
+    await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-nan")
+    with pytest.raises(LifecycleError, match="weight"):
+        await cp.release("bot", "0.1.0", principal, channel=ReleaseChannel.CANARY, weight=float("nan"))
+    with pytest.raises(LifecycleError, match="weight"):
+        await cp.release("bot", "0.1.0", principal, channel=ReleaseChannel.CANARY, weight=-1.0)
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.APPROVED
+    assert still.status.deployedVersions == []
+
+
 async def test_release_channel_string_full_raises_lifecycle_error(principal: Principal) -> None:
     cp = ControlPlane()
     try:

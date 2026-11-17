@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -54,15 +57,30 @@ def _snapshot_experiment_run(run: Any) -> Any:
     from agentsphere.evaluation.experiment import ExperimentRun
 
     try:
-        if isinstance(run, ExperimentRun):
-            stored = run.model_copy(deep=True)
-        elif hasattr(run, "model_dump"):
+        if hasattr(run, "model_dump"):
             stored = ExperimentRun.model_validate(run.model_dump())
         else:
             stored = ExperimentRun.model_validate(run, from_attributes=True)
+        stored = ExperimentRun.model_validate(stored.model_dump())
     except (TypeError, ValueError) as exc:
         raise LifecycleError("experiment run must be a snapshotable ExperimentRun") from exc
-    return stored.model_copy(deep=True)
+    if id(stored) is id(run) or type(stored) is not ExperimentRun:
+        raise LifecycleError("experiment run must be a snapshotable ExperimentRun")
+    copied = stored.model_copy(deep=True)
+    if id(copied) is id(run):
+        raise LifecycleError("experiment run must be a snapshotable ExperimentRun")
+    return copied
+
+
+def _experiment_evidence_key(run: Any) -> str:
+    payload = run.model_dump(mode="json")
+    payload.pop("run_id", None)
+    payload.pop("created_at", None)
+    spec = dict(payload.get("spec") or {})
+    spec.pop("tenant", None)
+    payload["spec"] = spec
+    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class ControlPlane:
@@ -75,8 +93,16 @@ class ControlPlane:
         self.store = store or InMemoryControlStore()
         self.runtime = runtime
         self._experiments: dict[str, Any] = {}
+        self._experiment_tenants: dict[str, str] = {}
+        self._experiment_origins: dict[str, str] = {}
 
-    def register_experiment(self, run: Any, *, tenant: str | None = None) -> Any:
+    def register_experiment(
+        self,
+        run: Any,
+        principal: Principal | None = None,
+        *,
+        tenant: str | None = None,
+    ) -> Any:
         """Index a stored ExperimentRun so evaluation and Gate can look it up by id."""
         run_id = getattr(run, "run_id", None)
         if not run_id:
@@ -86,21 +112,50 @@ class ControlPlane:
             raise LifecycleError(f"experiment run {key} is immutable")
         stored = _snapshot_experiment_run(run)
         spec = getattr(stored, "spec", None)
-        bound_tenant = tenant or (getattr(spec, "tenant", None) or "")
+        spec_tenant = getattr(spec, "tenant", None) or ""
+        caller_tenant = (principal.tenant if principal is not None else None) or tenant or ""
+        if spec_tenant and caller_tenant and spec_tenant != caller_tenant:
+            raise AuthorizationError(
+                f"cannot rebind experiment run from tenant {spec_tenant!r} to {caller_tenant!r}"
+            )
+        bound_tenant = spec_tenant or caller_tenant
         if not bound_tenant:
             raise LifecycleError("experiment run is missing tenant")
-        if spec is not None and getattr(spec, "tenant", None) != bound_tenant:
+        if spec is not None and spec_tenant != bound_tenant:
             stored = stored.model_copy(
                 update={"spec": spec.model_copy(update={"tenant": bound_tenant})},
                 deep=True,
             )
+        origin_key = _experiment_evidence_key(stored)
+        existing_origin = self._experiment_origins.get(origin_key)
+        if existing_origin is not None and existing_origin != bound_tenant:
+            raise AuthorizationError(
+                f"cannot rebind experiment evidence owned by tenant {existing_origin!r}"
+            )
         self._experiments[key] = stored
+        self._experiment_tenants[key] = bound_tenant
+        self._experiment_origins[origin_key] = bound_tenant
         return stored.model_copy(deep=True)
 
-    def get_experiment(self, run_id: str) -> Any | None:
+    def get_experiment(
+        self,
+        run_id: str,
+        principal: Principal | None = None,
+        *,
+        tenant: str | None = None,
+    ) -> Any | None:
+        tenant_id = tenant if tenant is not None else (principal.tenant if principal is not None else None)
+        if not tenant_id:
+            raise AuthorizationError("get_experiment requires a Principal or tenant")
         item = self._experiments.get(run_id)
         if item is None:
             return None
+        origin = self._experiment_tenants.get(run_id) or getattr(getattr(item, "spec", None), "tenant", None) or ""
+        if origin != tenant_id:
+            raise AuthorizationError(
+                f"tenant {tenant_id!r} cannot read experiment run {run_id} owned by tenant {origin!r}"
+            )
+        self._assert_experiment_tenant(item, tenant_id, run_id)
         return item.model_copy(deep=True)
 
     async def put_asset(
@@ -241,7 +296,7 @@ class ControlPlane:
         assert_transition_allowed(artifact.status.phase, LifecyclePhase.EVALUATED)
         if not experiment_run_id:
             raise LifecycleError("cannot mark Evaluated without an experiment run id")
-        run = self.get_experiment(experiment_run_id)
+        run = self.get_experiment(experiment_run_id, principal)
         if run is None:
             raise LifecycleError(f"unknown experiment run {experiment_run_id}")
         spec = getattr(run, "spec", None)
@@ -292,7 +347,7 @@ class ControlPlane:
         run_id = experiment_run_id or artifact.status.lastExperimentRunId
         if not run_id:
             raise LifecycleError("cannot record a Gate without an experiment run id")
-        run = self.get_experiment(run_id)
+        run = self.get_experiment(run_id, principal)
         if run is None:
             raise LifecycleError(f"unknown experiment run {run_id}")
         spec = getattr(run, "spec", None)
@@ -305,7 +360,11 @@ class ControlPlane:
             raise LifecycleError(
                 "Gate experiment run does not match the recorded evaluation"
             )
-        baseline = self.get_experiment(baseline_run_id) if baseline_run_id else None
+        baseline = None
+        if baseline_run_id:
+            baseline = self.get_experiment(baseline_run_id, principal)
+            if baseline is not None:
+                self._assert_experiment_tenant(baseline, artifact.metadata.tenant, baseline_run_id)
         from agentsphere.evaluation.gate import ReleaseGate
 
         decision = ReleaseGate().evaluate(run, thresholds=thresholds, baseline=baseline)
@@ -412,15 +471,17 @@ class ControlPlane:
             raise LifecycleError(
                 "cannot Release to Full; promote an active Canary instead"
             )
-        if weight is not None and weight >= 1.0:
+        if weight is not None and not (math.isfinite(weight) and 0.0 <= weight < 1.0):
             await self._emit(
                 ControlEventType.RELEASE_BLOCKED,
                 principal,
                 resource=artifact.resource_key(),
                 tenant=artifact.metadata.tenant,
-                details={"reason": "canary_weight", "weight": weight},
+                details={"reason": "canary_weight", "weight": str(weight)},
             )
-            raise LifecycleError("canary weight must be < 1.0; promote for Full")
+            raise LifecycleError(
+                "canary weight must be finite and 0 <= weight < 1.0; promote for Full"
+            )
         if verified.experiment_run_id != artifact.status.lastExperimentRunId:
             await self._emit(
                 ControlEventType.RELEASE_BLOCKED,

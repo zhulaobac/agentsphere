@@ -15,6 +15,7 @@ from agentsphere.controlplane import (
     LifecyclePhase,
     Principal,
 )
+from agentsphere.evaluation.experiment import ExperimentRun
 from tests.experiment_stubs import ready_draft, stub_experiment_run
 
 
@@ -193,6 +194,51 @@ async def test_foreign_principal_cannot_use_experiment_run(
     still = await cp.get_artifact("bot", "0.1.0", other_tenant)
     assert still.status.phase is LifecyclePhase.BUILT
     assert still.status.deployedVersions == []
+
+    with pytest.raises(AuthorizationError):
+        cp.get_experiment("exp-shared")
+    with pytest.raises(AuthorizationError):
+        cp.get_experiment("exp-shared", other_tenant)
+    alice_run = cp.get_experiment("exp-shared", principal)
+    assert alice_run is not None
+    assert alice_run.spec.tenant == principal.tenant
+
+    stolen = alice_run.model_copy(update={"run_id": "exp-stolen"})
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(stolen, tenant=other_tenant.tenant)
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(stolen, other_tenant)
+    data = alice_run.model_dump()
+    data["run_id"] = "exp-stolen2"
+    data["spec"]["tenant"] = other_tenant.tenant
+    rewritten = ExperimentRun.model_validate(data)
+    with pytest.raises(AuthorizationError):
+        cp.register_experiment(rewritten)
+    with pytest.raises((AuthorizationError, LifecycleError)):
+        await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id="exp-stolen2")
+
+    cp.register_experiment(
+        stub_experiment_run(
+            "bob-run",
+            "bot",
+            "0.1.0",
+            pass_rate=0.0,
+            safety_failed=True,
+            tenant=other_tenant.tenant,
+        )
+    )
+    await cp.record_evaluation("bot", "0.1.0", other_tenant, experiment_run_id="bob-run")
+    with pytest.raises(AuthorizationError):
+        await cp.record_gate(
+            "bot",
+            "0.1.0",
+            other_tenant,
+            experiment_run_id="bob-run",
+            baseline_run_id="exp-shared",
+        )
+    after = await cp.get_artifact("bot", "0.1.0", other_tenant)
+    assert after.status.phase is LifecyclePhase.EVALUATED
+    assert after.status.deployedVersions == []
 
 
 async def test_foreign_asset_ref_cannot_be_built_or_bound(

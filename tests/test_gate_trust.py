@@ -28,6 +28,7 @@ from agentsphere.evaluation import (
     ScriptedExecutor,
     SliceTags,
 )
+from agentsphere.evaluation.experiment import ExperimentRun
 from tests.experiment_stubs import ready_draft, stub_experiment_run
 
 
@@ -242,12 +243,48 @@ async def test_mutable_experiment_standin_cannot_pass_gate(principal: Principal)
         standin.cases[0].samples[0].result.score = 1.0
         if len(standin.cases) > 1:
             standin.cases[1].samples[0].passed = True
-    stored = cp.get_experiment("exp-mut")
+    stored = cp.get_experiment("exp-mut", principal)
     assert stored is not None
     assert stored.summary.pass_rate < 1.0
     await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp-mut")
     await cp.approve("bot", "0.1.0", principal)
     _, decision = await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-mut")
+    assert decision.passed is False
+    with pytest.raises(GateFailedError):
+        await cp.release("bot", "0.1.0", principal)
+    still = await cp.get_artifact("bot", "0.1.0", principal)
+    assert still.status.phase is LifecyclePhase.APPROVED
+    assert still.status.deployedVersions == []
+
+
+class _EvilRun(ExperimentRun):
+    def model_copy(self, *args: object, **kwargs: object) -> ExperimentRun:
+        return self
+
+
+async def test_evil_experiment_subclass_cannot_pass_gate(principal: Principal) -> None:
+    cp = ControlPlane()
+    await ready_draft(cp, principal)
+    await cp.build("bot", "0.1.0", principal)
+    failing = stub_experiment_run(
+        "exp-evil", "bot", "0.1.0", pass_rate=0.0, safety_failed=True, tenant=principal.tenant
+    )
+    evil = _EvilRun.model_validate(failing.model_dump())
+    registered = cp.register_experiment(evil)
+    assert registered is not evil
+    evil.summary.pass_rate = 1.0
+    for case in evil.cases:
+        for sample in case.samples:
+            sample.passed = True
+            sample.result.passed = True
+            sample.result.score = 1.0
+    stored = cp.get_experiment("exp-evil", principal)
+    assert stored is not None
+    assert stored.summary.pass_rate < 1.0
+    assert stored is not evil
+    await cp.record_evaluation("bot", "0.1.0", principal, experiment_run_id="exp-evil")
+    await cp.approve("bot", "0.1.0", principal)
+    _, decision = await cp.record_gate("bot", "0.1.0", principal, experiment_run_id="exp-evil")
     assert decision.passed is False
     with pytest.raises(GateFailedError):
         await cp.release("bot", "0.1.0", principal)

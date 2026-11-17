@@ -292,7 +292,7 @@ class ExperimentRunner:
             dataset_content_hash=_dataset_content_hash(dataset),
         )
         stored = self.store.put(run)
-        self.control.register_experiment(stored)
+        self.control.register_experiment(stored, principal)
         self._pin_dataset(artifact, dataset, principal)
         return stored
 
