@@ -38,3 +38,6 @@ jobs:
 
       - name: Run fixture release Gate
         run: python -m agentsphere.evaluation.ci_gate
+
+      - name: Run product-team fixture path
+        run: python -m agentsphere.tenants.product_team.ci

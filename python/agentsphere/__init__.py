@@ -1,4 +1,4 @@
-"""AgentSphere: Harness Kernel, Managed Runtime, Sandbox, Identity/Vault, Control Plane, Eval."""
+"""AgentSphere: Harness Kernel, Managed Runtime, Sandbox, Identity/Vault, Control Plane, Eval, Tenants."""
 
 from agentsphere.controlplane import (
     AgentArtifact,
@@ -31,6 +31,8 @@ from agentsphere.kernel import (
 from agentsphere.model_adapter import MockModelProvider, ModelAdapter
 from agentsphere.runtime import SessionRuntime, WorkerLease, build_runtime
 from agentsphere.sandbox import SandboxSpec, SubprocessSandbox
+from agentsphere.tenants import TenantRegistry
+from agentsphere.tenants.product_team import ProductTeamPack
 from agentsphere.tool_registry import ToolRegistry, ToolSpec
 from agentsphere.trace import TraceRecorder
 
@@ -45,6 +47,7 @@ __all__ = [
     "InMemoryControlStore",
     "ManagedRuntimeProvider",
     "Principal",
+    "ProductTeamPack",
     "ReleaseGate",
     "RuleAssertionEvaluator",
     "CallModel",
@@ -65,6 +68,7 @@ __all__ = [
     "StaticPolicyEngine",
     "SubprocessSandbox",
     "ToolRegistry",
+    "TenantRegistry",
     "ToolSpec",
     "TraceRecorder",
     "WorkerLease",

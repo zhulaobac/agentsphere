@@ -10,12 +10,17 @@ substrate: checkpoints, worker leases, idempotent tool execution, pause /
 resume / cancel, HITL, Sandbox, Agent Identity, Credential Vault, policy, and
 audit.
 
-P1 second slice (this tree) adds the Python Control Plane (unified Agent
-Artifact, versioned assets, lifecycle, canary/full release, rollback, tenant
-scoping, Managed Runtime Provider) and the Evaluation foundation (datasets,
-pluggable evaluators, Experiment, regression, Release Gate). Memory/RAG, MCP
-Gateway, Planner-Executor, Multi-Agent, BYO hosting, cost governance, online
-sampling, the evolver, and Anchor Tenant integration remain out of scope.
+P1 second slice added the Python Control Plane (unified Agent Artifact,
+versioned assets, lifecycle, canary/full release, rollback, tenant scoping,
+Managed Runtime Provider) and the Evaluation foundation (datasets, pluggable
+evaluators, Experiment, regression, Release Gate).
+
+P1 third slice (this tree) onboards the first Anchor Tenant: **product-team**
+(display name 产品团队). Its first workflow is requirements research and
+competitive analysis (需求调研和竞品分析). A later second tenant should
+implement the same `TenantPack` interface. Memory/RAG, MCP Gateway,
+Planner-Executor, Multi-Agent, BYO hosting, cost governance, online sampling,
+the evolver, and a second production Anchor Tenant remain out of scope.
 
 ## Layout
 
@@ -31,6 +36,7 @@ python/agentsphere/          # Python packages (Kernel + Runtime + security + P1
   identity/                  # Agent Identity, Credential Vault, policy, audit
   controlplane/              # Artifact Registry, lifecycle, release, Runtime Provider
   evaluation/                # Datasets, evaluators, Experiment, regression, Gate
+  tenants/                   # Anchor Tenant packs (product-team first; reusable TenantPack)
 control-plane/               # Reserved for future Go services (same contracts)
 tests/                       # Unit + integration tests (offline)
 .github/workflows/ci.yml     # GitHub Actions: pytest + fixture Release Gate
@@ -70,7 +76,10 @@ pytest tests/test_controlplane_artifacts.py tests/test_lifecycle.py \
        tests/test_controlplane_auth.py tests/test_release.py \
        tests/test_evaluation.py tests/test_experiment.py \
        tests/test_gate.py tests/test_ci_gate.py                          # P1 CP + Eval
+pytest tests/test_product_team_tenant.py tests/test_product_team_isolation.py
+                                                                         # P1 first Anchor Tenant
 python -m agentsphere.evaluation.ci_gate                          # fixture Release Gate
+python -m agentsphere.tenants.product_team.ci                     # product-team canary → Full
 ```
 
 CI runs `pytest` then `python -m agentsphere.evaluation.ci_gate` on `main` and
@@ -107,6 +116,8 @@ from agentsphere import (
     ManagedRuntimeProvider,# Control Plane → existing Managed Runtime (not a second runtime)
     ExperimentRunner,      # (agent version, dataset version, evaluator version, env)
     ReleaseGate,           # mandatory check before Approved → Released
+    ProductTeamPack,       # first Anchor Tenant (product-team / 产品团队)
+    TenantRegistry,        # tenant records; principals only see their own tenant
 )
 ```
 
